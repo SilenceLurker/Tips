@@ -116,12 +116,15 @@ fn delete_todo_entry(
 }
 
 #[tauri::command]
-fn open_sticky_window(
-    app: AppHandle,
-    state: State<'_, Store>,
-    item_id: String,
-) -> Result<String, String> {
-    windowing::open_sticky(&app, &state, &item_id)
+async fn open_sticky_window(app: AppHandle, item_id: String) -> Result<String, String> {
+    // WebView2 IPC is delivered from a WebResourceRequested callback on Windows. Creating a
+    // second webview synchronously inside that callback deadlocks controller initialization.
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<Store>();
+        windowing::open_sticky(&app, &state, &item_id)
+    })
+    .await
+    .map_err(|error| format!("open sticky window task failed: {error}"))?
 }
 
 #[tauri::command]
