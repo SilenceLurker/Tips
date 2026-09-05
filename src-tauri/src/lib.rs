@@ -3,9 +3,14 @@ mod mcp_server;
 mod model;
 mod native_i18n;
 mod store;
+mod sync_bundle;
 mod windowing;
 
-use std::{fs, io, path::PathBuf};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    path::PathBuf,
+};
 
 use mcp_model::{
     CreateMcpClientInput, McpClientView, McpGroupGrantView, McpGroupRole, McpTransport,
@@ -22,11 +27,13 @@ use model::{
 use model::{ItemColor, ItemKind, WindowGeometryInput};
 use serde::Serialize;
 use store::{Store, load_or_create_master_key};
+use sync_bundle::{MAX_SYNC_BUNDLE_BYTES, SyncBundle, SyncExportSummary, SyncImportSummary};
 use tauri::{
     AppHandle, Emitter, Manager, State, WindowEvent,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent, TrayIconId},
 };
+use tauri_plugin_dialog::DialogExt;
 
 const TRAY_ID: &str = "main-tray";
 
@@ -257,6 +264,117 @@ fn set_locale(
         eprintln!("notify locale update failed after persistence: {error}");
     }
     Ok(locale)
+}
+
+#[tauri::command]
+async fn export_sync_bundle(
+    _main_window: MainWindowOnly,
+    app: AppHandle,
+    state: State<'_, Store>,
+) -> Result<Option<SyncExportSummary>, String> {
+    let Some(file_path) = app
+        .dialog()
+        .file()
+        .add_filter("Tips progress", &["json"])
+        .set_file_name("Tips-progress.json")
+        .blocking_save_file()
+    else {
+        return Ok(None);
+    };
+    let mut path = file_path
+        .into_path()
+        .map_err(|error| format!("export requires a local file path: {error}"))?;
+    if path.extension().is_none() {
+        path.set_extension("json");
+    }
+    let (bundle, summary) = state.export_sync_bundle()?;
+    let encoded = serde_json::to_vec_pretty(&bundle)
+        .map_err(|error| format!("encode progress file failed: {error}"))?;
+    if encoded.len() as u64 > MAX_SYNC_BUNDLE_BYTES {
+        return Err(format!(
+            "progress file is larger than the {} MiB limit",
+            MAX_SYNC_BUNDLE_BYTES / 1024 / 1024
+        ));
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("open export file failed: {error}"))?;
+    file.write_all(&encoded)
+        .map_err(|error| format!("write progress file failed: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("finish progress file failed: {error}"))?;
+    Ok(Some(summary))
+}
+
+#[tauri::command]
+async fn import_sync_bundle(
+    _main_window: MainWindowOnly,
+    app: AppHandle,
+    state: State<'_, Store>,
+) -> Result<Option<SyncImportSummary>, String> {
+    let Some(file_path) = app
+        .dialog()
+        .file()
+        .add_filter("Tips progress", &["json"])
+        .blocking_pick_file()
+    else {
+        return Ok(None);
+    };
+    let path = file_path
+        .into_path()
+        .map_err(|error| format!("import requires a local file path: {error}"))?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("read progress file metadata failed: {error}"))?;
+    if !metadata.is_file() {
+        return Err("the selected import path is not a file".to_string());
+    }
+    if metadata.len() > MAX_SYNC_BUNDLE_BYTES {
+        return Err(format!(
+            "progress file is larger than the {} MiB limit",
+            MAX_SYNC_BUNDLE_BYTES / 1024 / 1024
+        ));
+    }
+
+    let mut encoded = Vec::with_capacity(metadata.len() as usize);
+    File::open(&path)
+        .map_err(|error| format!("open progress file failed: {error}"))?
+        .take(MAX_SYNC_BUNDLE_BYTES + 1)
+        .read_to_end(&mut encoded)
+        .map_err(|error| format!("read progress file failed: {error}"))?;
+    if encoded.len() as u64 > MAX_SYNC_BUNDLE_BYTES {
+        return Err(format!(
+            "progress file is larger than the {} MiB limit",
+            MAX_SYNC_BUNDLE_BYTES / 1024 / 1024
+        ));
+    }
+    let bundle: SyncBundle = serde_json::from_slice(&encoded)
+        .map_err(|error| format!("decode progress file failed: {error}"))?;
+    let outcome = state.import_sync_bundle(bundle)?;
+
+    for item_id in &outcome.changed_item_ids {
+        let mut item = match state.get_item(item_id) {
+            Ok(item) => item,
+            Err(error) => {
+                eprintln!("read imported item for UI notification failed: {error}");
+                continue;
+            }
+        };
+        if item.status == model::ItemStatus::Archived {
+            if let Err(error) = windowing::hide_sticky(&app, &state, &item.id) {
+                eprintln!("hide sticky window after import failed: {error}");
+            } else if let Ok(refreshed) = state.get_item(&item.id) {
+                item = refreshed;
+            }
+        }
+        if let Err(error) = app.emit("items-changed", &item) {
+            eprintln!("notify imported item update failed: {error}");
+        }
+    }
+    Ok(Some(outcome.summary))
 }
 
 #[derive(Debug, Serialize)]
@@ -546,7 +664,7 @@ fn is_allowed_navigation(url: &tauri::Url, allow_dev_server: bool) -> bool {
 }
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
         show_main_window(app);
@@ -615,6 +733,8 @@ pub fn run() {
             set_theme,
             get_locale,
             set_locale,
+            export_sync_bundle,
+            import_sync_bundle,
             get_mcp_runtime_status,
             list_mcp_clients,
             list_mcp_group_grants,

@@ -27,6 +27,27 @@ export default {
     enUS: "English",
     saveFailed: "Unable to save the language preference: {error}",
   },
+  sync: {
+    card: {
+      title: "Move progress",
+      description: "Manually import or export regular notes, to-dos, and groups between devices",
+      warning: "Progress files are plaintext JSON. Secrets, sensitive items, MCP credentials, and window settings are excluded.",
+    },
+    actions: {
+      export: "Export",
+      exporting: "Exporting…",
+      import: "Import",
+      importing: "Importing…",
+    },
+    feedback: {
+      exported: "Exported {items} items and {groups} groups; excluded {excluded} private items",
+      imported: "Import complete: {added} added, {updated} updated, {unchanged} unchanged, {groups} groups added; {newer} newer local items and {conflicts} conflicts skipped",
+    },
+    errors: {
+      exportFailed: "Export failed: {error}",
+      importFailed: "Import failed: {error}",
+    },
+  },
   date: {
     never: "Never",
     invalid: "Invalid date",

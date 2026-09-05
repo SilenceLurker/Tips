@@ -48,6 +48,21 @@ export interface ProvisionedMcpClient {
   endpoint: string;
 }
 
+export interface SyncExportSummary {
+  groupCount: number;
+  itemCount: number;
+  excludedPrivateCount: number;
+}
+
+export interface SyncImportSummary {
+  groupsAdded: number;
+  itemsAdded: number;
+  itemsUpdated: number;
+  itemsUnchanged: number;
+  newerLocalItems: number;
+  conflicts: number;
+}
+
 export interface WindowState {
   x: number | null;
   y: number | null;

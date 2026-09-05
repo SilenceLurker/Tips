@@ -27,6 +27,27 @@ export default {
     enUS: "English",
     saveFailed: "语言偏好保存失败：{error}",
   },
+  sync: {
+    card: {
+      title: "迁移进度",
+      description: "在设备间手动导入或导出普通便签、TODO 与分组",
+      warning: "进度文件是明文 JSON；不会包含密文、敏感条目、MCP 凭据或窗口设置。",
+    },
+    actions: {
+      export: "导出",
+      exporting: "导出中…",
+      import: "导入",
+      importing: "导入中…",
+    },
+    feedback: {
+      exported: "已导出 {items} 项、{groups} 个分组；排除 {excluded} 个私密项",
+      imported: "导入完成：新增 {added}、更新 {updated}、未变 {unchanged}、新增分组 {groups}；跳过本机较新 {newer}，冲突 {conflicts}",
+    },
+    errors: {
+      exportFailed: "导出失败：{error}",
+      importFailed: "导入失败：{error}",
+    },
+  },
   date: {
     never: "从未",
     invalid: "无效时间",

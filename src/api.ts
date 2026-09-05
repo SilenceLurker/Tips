@@ -10,6 +10,8 @@ import type {
   McpRuntimeStatus,
   ProvisionMcpClientInput,
   ProvisionedMcpClient,
+  SyncExportSummary,
+  SyncImportSummary,
   ThemeMode,
   TodoEntry,
   UpdateItemInput,
@@ -140,6 +142,16 @@ export const settingsApi = {
 
   setLocale(locale: LocalePreference) {
     return invoke<LocalePreference>("set_locale", { locale });
+  },
+};
+
+export const syncApi = {
+  exportProgress() {
+    return invoke<SyncExportSummary | null>("export_sync_bundle");
+  },
+
+  importProgress() {
+    return invoke<SyncImportSummary | null>("import_sync_bundle");
   },
 };
 

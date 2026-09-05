@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useI18n } from "vue-i18n";
-import { errorMessage, groupsApi, itemsApi, mcpApi } from "../api";
+import { errorMessage, groupsApi, itemsApi, mcpApi, syncApi } from "../api";
 import { useLocale } from "../i18n";
 import { useTheme } from "../theme";
 import {
@@ -73,6 +73,8 @@ const groupRenameInput = ref<HTMLInputElement | null>(null);
 const groupSaving = ref(false);
 const mcpPanelOpen = ref(false);
 const localeSaving = ref(false);
+const syncBusy = ref<"export" | "import" | null>(null);
+const syncResult = ref("");
 const floatAfterCreate = ref(true);
 const toast = ref("");
 const error = ref("");
@@ -927,6 +929,57 @@ function notify(message: string) {
   }, 2200);
 }
 
+async function exportProgress() {
+  if (syncBusy.value) return;
+  syncBusy.value = "export";
+  syncResult.value = "";
+  error.value = "";
+  try {
+    const result = await syncApi.exportProgress();
+    if (!result) return;
+    syncResult.value = t("sync.feedback.exported", {
+      groups: result.groupCount,
+      items: result.itemCount,
+      excluded: result.excludedPrivateCount,
+    });
+    notify(syncResult.value);
+  } catch (cause) {
+    error.value = t("sync.errors.exportFailed", {
+      error: errorMessage(cause, t("errors.unknown")),
+    });
+  } finally {
+    syncBusy.value = null;
+  }
+}
+
+async function importProgress() {
+  if (syncBusy.value) return;
+  syncBusy.value = "import";
+  syncResult.value = "";
+  error.value = "";
+  try {
+    const result = await syncApi.importProgress();
+    if (!result) return;
+    await refresh();
+    ensureMcpGroupSelections();
+    syncResult.value = t("sync.feedback.imported", {
+      groups: result.groupsAdded,
+      added: result.itemsAdded,
+      updated: result.itemsUpdated,
+      unchanged: result.itemsUnchanged,
+      newer: result.newerLocalItems,
+      conflicts: result.conflicts,
+    });
+    notify(syncResult.value);
+  } catch (cause) {
+    error.value = t("sync.errors.importFailed", {
+      error: errorMessage(cause, t("errors.unknown")),
+    });
+  } finally {
+    syncBusy.value = null;
+  }
+}
+
 async function switchTheme() {
   try {
     const next = await toggleTheme();
@@ -1158,6 +1211,27 @@ function isExpired(item: Item): boolean {
           </option>
         </select>
       </label>
+
+      <section class="sync-panel" :aria-busy="Boolean(syncBusy)">
+        <div class="sync-panel-heading">
+          <span>
+            <strong>{{ t("sync.card.title") }}</strong>
+            <small>{{ t("sync.card.description") }}</small>
+          </span>
+        </div>
+        <div class="sync-actions">
+          <button type="button" :disabled="Boolean(syncBusy)" @click="exportProgress">
+            <span>↑</span>
+            {{ t(syncBusy === "export" ? "sync.actions.exporting" : "sync.actions.export") }}
+          </button>
+          <button type="button" :disabled="Boolean(syncBusy)" @click="importProgress">
+            <span>↓</span>
+            {{ t(syncBusy === "import" ? "sync.actions.importing" : "sync.actions.import") }}
+          </button>
+        </div>
+        <small v-if="syncResult" class="sync-result" aria-live="polite">{{ syncResult }}</small>
+        <small class="sync-warning">{{ t("sync.card.warning") }}</small>
+      </section>
 
       <button
         type="button"

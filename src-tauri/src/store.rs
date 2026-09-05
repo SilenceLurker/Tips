@@ -25,6 +25,10 @@ use crate::model::{
     SetStatusInput, SetTodoEntryCompletedInput, ThemeMode, TodoEntry, TodoEntryDraftInput,
     UpdateItemInput, UpdateTodoEntryInput, WindowGeometryInput, WindowOpacityInput, WindowState,
 };
+use crate::sync_bundle::{
+    MAX_SYNC_BUNDLE_GROUPS, MAX_SYNC_BUNDLE_ITEMS, SYNC_BUNDLE_FORMAT, SYNC_BUNDLE_VERSION,
+    SyncBundle, SyncExportSummary, SyncGroup, SyncImportOutcome, SyncImportSummary, SyncItem,
+};
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const WINDOW_OPACITY_MIGRATION: &str = include_str!("../migrations/002_window_opacity.sql");
@@ -517,6 +521,205 @@ impl Store {
             .map_err(|error| format!("query groups failed: {error}"))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| format!("read group failed: {error}"))
+    }
+
+    pub fn export_sync_bundle(&self) -> Result<(SyncBundle, SyncExportSummary), String> {
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("start sync export transaction failed: {error}"))?;
+
+        let mut groups = {
+            let mut statement = transaction
+                .prepare(
+                    r#"
+                    SELECT group_key, created_at, updated_at
+                    FROM item_groups
+                    ORDER BY group_key COLLATE NOCASE
+                    "#,
+                )
+                .map_err(|error| format!("prepare sync group export failed: {error}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(SyncGroup {
+                        key: row.get(0)?,
+                        created_at: row.get(1)?,
+                        updated_at: row.get(2)?,
+                    })
+                })
+                .map_err(|error| format!("query sync groups failed: {error}"))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| format!("read sync group failed: {error}"))?
+        };
+
+        let excluded_private_count = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM items WHERE kind = 'secret' OR sensitivity = 'sensitive'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("count private items excluded from sync failed: {error}"))?
+            as usize;
+        let stored_items = {
+            let sql = format!(
+                "{ITEM_SELECT} WHERE i.kind IN ('note', 'todo') AND i.sensitivity = 'standard' ORDER BY i.id"
+            );
+            let mut statement = transaction
+                .prepare(&sql)
+                .map_err(|error| format!("prepare sync item export failed: {error}"))?;
+            let rows = statement
+                .query_map([], Self::read_stored_item)
+                .map_err(|error| format!("query sync items failed: {error}"))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| format!("read sync item failed: {error}"))?
+        };
+
+        let mut items = Vec::new();
+        for stored in stored_items {
+            let mut item = self.decrypt_item(stored)?;
+            item.todo_entries = self.read_todo_entries(&transaction, &item.id)?;
+            items.push(SyncItem::from_item(item));
+        }
+
+        if groups.len() > MAX_SYNC_BUNDLE_GROUPS {
+            return Err(format!(
+                "too many groups to export; the portable format supports at most {MAX_SYNC_BUNDLE_GROUPS}"
+            ));
+        }
+        if items.len() > MAX_SYNC_BUNDLE_ITEMS {
+            return Err(format!(
+                "too many items to export; the portable format supports at most {MAX_SYNC_BUNDLE_ITEMS}"
+            ));
+        }
+
+        transaction
+            .commit()
+            .map_err(|error| format!("finish sync export transaction failed: {error}"))?;
+        groups.sort_by(|left, right| left.key.cmp(&right.key));
+        items.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let summary = SyncExportSummary {
+            group_count: groups.len(),
+            item_count: items.len(),
+            excluded_private_count,
+        };
+        Ok((
+            SyncBundle {
+                format: SYNC_BUNDLE_FORMAT.to_string(),
+                version: SYNC_BUNDLE_VERSION,
+                application_version: env!("CARGO_PKG_VERSION").to_string(),
+                exported_at: now_ms(),
+                groups,
+                items,
+            },
+            summary,
+        ))
+    }
+
+    pub fn import_sync_bundle(&self, bundle: SyncBundle) -> Result<SyncImportOutcome, String> {
+        let bundle = validate_sync_bundle(bundle)?;
+        let SyncBundle { groups, items, .. } = bundle;
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("start sync import transaction failed: {error}"))?;
+
+        let private_item_ids = {
+            let mut statement = transaction
+                .prepare("SELECT id FROM items WHERE kind = 'secret' OR sensitivity = 'sensitive'")
+                .map_err(|error| format!("prepare private item conflict check failed: {error}"))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| format!("query private item conflicts failed: {error}"))?;
+            rows.collect::<rusqlite::Result<HashSet<_>>>()
+                .map_err(|error| format!("read private item conflicts failed: {error}"))?
+        };
+        let current_items = {
+            let sql = format!(
+                "{ITEM_SELECT} WHERE i.kind IN ('note', 'todo') AND i.sensitivity = 'standard' ORDER BY i.id"
+            );
+            let mut statement = transaction
+                .prepare(&sql)
+                .map_err(|error| format!("prepare current sync items failed: {error}"))?;
+            let rows = statement
+                .query_map([], Self::read_stored_item)
+                .map_err(|error| format!("query current sync items failed: {error}"))?;
+            let stored_items = rows
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| format!("read current sync item failed: {error}"))?;
+            drop(statement);
+
+            let mut current_items = HashMap::new();
+            for stored in stored_items {
+                let mut item = self.decrypt_item(stored)?;
+                item.todo_entries = self.read_todo_entries(&transaction, &item.id)?;
+                current_items.insert(item.id.clone(), item);
+            }
+            current_items
+        };
+
+        let mut summary = SyncImportSummary {
+            groups_added: 0,
+            items_added: 0,
+            items_updated: 0,
+            items_unchanged: 0,
+            newer_local_items: 0,
+            conflicts: 0,
+        };
+        for group in groups {
+            summary.groups_added += Self::merge_sync_group(&transaction, &group)?;
+        }
+
+        let mut changed_item_ids = Vec::new();
+        for item in items {
+            summary.groups_added += Self::merge_sync_group(
+                &transaction,
+                &SyncGroup {
+                    key: item.group.clone(),
+                    created_at: item.created_at,
+                    updated_at: item.updated_at,
+                },
+            )?;
+
+            if private_item_ids.contains(&item.id) {
+                summary.conflicts += 1;
+                continue;
+            }
+            let Some(current) = current_items.get(&item.id) else {
+                self.insert_sync_item(&transaction, &item)?;
+                summary.items_added += 1;
+                changed_item_ids.push(item.id);
+                continue;
+            };
+
+            if item.matches_item(current) {
+                summary.items_unchanged += 1;
+                continue;
+            }
+            if item.revision < current.revision {
+                summary.newer_local_items += 1;
+                continue;
+            }
+            if item.revision == current.revision {
+                summary.conflicts += 1;
+                continue;
+            }
+
+            if self.replace_sync_item(&transaction, &item, current.revision)? {
+                summary.items_updated += 1;
+                changed_item_ids.push(item.id);
+            } else {
+                summary.conflicts += 1;
+            }
+        }
+
+        transaction
+            .commit()
+            .map_err(|error| format!("commit sync import failed: {error}"))?;
+        Ok(SyncImportOutcome {
+            summary,
+            changed_item_ids,
+        })
     }
 
     pub fn create_group(&self, input: CreateGroupInput) -> Result<ItemGroup, String> {
@@ -2651,6 +2854,195 @@ impl Store {
         Ok(())
     }
 
+    fn merge_sync_group(transaction: &Transaction<'_>, group: &SyncGroup) -> Result<usize, String> {
+        let inserted = transaction
+            .execute(
+                "INSERT OR IGNORE INTO item_groups (group_key, created_at, updated_at) VALUES (?1, ?2, ?3)",
+                params![&group.key, group.created_at, group.updated_at],
+            )
+            .map_err(|error| format!("insert imported group failed: {error}"))?;
+        transaction
+            .execute(
+                r#"
+                UPDATE item_groups
+                SET created_at = MIN(created_at, ?1),
+                    updated_at = MAX(updated_at, ?2)
+                WHERE group_key = ?3
+                "#,
+                params![group.created_at, group.updated_at, &group.key],
+            )
+            .map_err(|error| format!("merge imported group metadata failed: {error}"))?;
+        Ok(inserted)
+    }
+
+    fn insert_sync_item(
+        &self,
+        transaction: &Transaction<'_>,
+        item: &SyncItem,
+    ) -> Result<(), String> {
+        let tags_json = serde_json::to_string(&item.tags)
+            .map_err(|error| format!("serialize imported tags failed: {error}"))?;
+        let (ciphertext, nonce) = self.encrypt_content(&item.id, &item.content)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO items (
+                    id, kind, group_key, title, content_ciphertext, content_nonce, content_version,
+                    status, sensitivity, color, tags_json, due_at, expires_at,
+                    completed_at, mcp_access, revision, created_at, updated_at, archived_at
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, 1,
+                    ?7, 'standard', ?8, ?9, ?10, ?11,
+                    ?12, ?13, ?14, ?15, ?16, ?17
+                )
+                "#,
+                params![
+                    &item.id,
+                    item.kind.as_str(),
+                    &item.group,
+                    &item.title,
+                    ciphertext,
+                    nonce,
+                    item.status.as_str(),
+                    item.color.as_str(),
+                    tags_json,
+                    item.due_at,
+                    item.expires_at,
+                    item.completed_at,
+                    item.mcp_access.as_str(),
+                    item.revision,
+                    item.created_at,
+                    item.updated_at,
+                    item.archived_at,
+                ],
+            )
+            .map_err(|error| format!("insert imported item failed: {error}"))?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO item_windows (
+                    item_id, width, height, scale_factor, always_on_top,
+                    opacity, is_visible, updated_at
+                ) VALUES (?1, 340, 360, 1, 1, 1, 0, ?2)
+                "#,
+                params![&item.id, item.updated_at],
+            )
+            .map_err(|error| format!("create imported item window state failed: {error}"))?;
+        self.insert_sync_todo_entries(transaction, item)
+    }
+
+    fn replace_sync_item(
+        &self,
+        transaction: &Transaction<'_>,
+        item: &SyncItem,
+        expected_revision: i64,
+    ) -> Result<bool, String> {
+        let tags_json = serde_json::to_string(&item.tags)
+            .map_err(|error| format!("serialize imported tags failed: {error}"))?;
+        let (ciphertext, nonce) = self.encrypt_content(&item.id, &item.content)?;
+        let changed = transaction
+            .execute(
+                r#"
+                UPDATE items
+                SET kind = ?1,
+                    group_key = ?2,
+                    title = ?3,
+                    content_ciphertext = ?4,
+                    content_nonce = ?5,
+                    content_version = 1,
+                    status = ?6,
+                    sensitivity = 'standard',
+                    color = ?7,
+                    tags_json = ?8,
+                    due_at = ?9,
+                    expires_at = ?10,
+                    completed_at = ?11,
+                    mcp_access = ?12,
+                    revision = ?13,
+                    created_at = ?14,
+                    updated_at = ?15,
+                    archived_at = ?16
+                WHERE id = ?17
+                  AND revision = ?18
+                  AND kind <> 'secret'
+                  AND sensitivity = 'standard'
+                "#,
+                params![
+                    item.kind.as_str(),
+                    &item.group,
+                    &item.title,
+                    ciphertext,
+                    nonce,
+                    item.status.as_str(),
+                    item.color.as_str(),
+                    tags_json,
+                    item.due_at,
+                    item.expires_at,
+                    item.completed_at,
+                    item.mcp_access.as_str(),
+                    item.revision,
+                    item.created_at,
+                    item.updated_at,
+                    item.archived_at,
+                    &item.id,
+                    expected_revision,
+                ],
+            )
+            .map_err(|error| format!("replace imported item failed: {error}"))?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        transaction
+            .execute("DELETE FROM todo_entries WHERE item_id = ?1", [&item.id])
+            .map_err(|error| format!("replace imported TODO entries failed: {error}"))?;
+        self.insert_sync_todo_entries(transaction, item)?;
+        Ok(true)
+    }
+
+    fn insert_sync_todo_entries(
+        &self,
+        transaction: &Transaction<'_>,
+        item: &SyncItem,
+    ) -> Result<(), String> {
+        for entry in &item.todo_entries {
+            let existing_owner = transaction
+                .query_row(
+                    "SELECT item_id FROM todo_entries WHERE id = ?1",
+                    [&entry.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| format!("check imported TODO entry id failed: {error}"))?;
+            if existing_owner.is_some() {
+                return Err("an imported TODO entry id already belongs to another item".to_string());
+            }
+            let (ciphertext, nonce) = self.encrypt_todo_entry(&item.id, &entry.id, &entry.text)?;
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO todo_entries (
+                        id, item_id, text_ciphertext, text_nonce, text_version,
+                        is_completed, position, revision, created_at, updated_at, completed_at
+                    ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10)
+                    "#,
+                    params![
+                        &entry.id,
+                        &item.id,
+                        ciphertext,
+                        nonce,
+                        bool_to_int(entry.is_completed),
+                        entry.position,
+                        entry.revision,
+                        entry.created_at,
+                        entry.updated_at,
+                        entry.completed_at,
+                    ],
+                )
+                .map_err(|error| format!("insert imported TODO entry failed: {error}"))?;
+        }
+        Ok(())
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, String> {
         self.connection
             .lock()
@@ -2855,6 +3247,248 @@ fn validate_optional_timestamp_ms(label: &str, value: Option<i64>) -> Result<(),
     Ok(())
 }
 
+fn validate_sync_bundle(mut bundle: SyncBundle) -> Result<SyncBundle, String> {
+    if bundle.format != SYNC_BUNDLE_FORMAT {
+        return Err(format!(
+            "unsupported import format; expected {SYNC_BUNDLE_FORMAT}"
+        ));
+    }
+    if bundle.version != SYNC_BUNDLE_VERSION {
+        return Err(format!(
+            "unsupported import version {}; this build supports version {SYNC_BUNDLE_VERSION}",
+            bundle.version
+        ));
+    }
+    let application_version = bundle.application_version.trim();
+    if application_version.is_empty() || application_version.chars().count() > 64 {
+        return Err("import application version is invalid".to_string());
+    }
+    bundle.application_version = application_version.to_string();
+    validate_optional_timestamp_ms("exportedAt", Some(bundle.exported_at))?;
+    if bundle.groups.len() > MAX_SYNC_BUNDLE_GROUPS {
+        return Err(format!(
+            "import contains too many groups; the limit is {MAX_SYNC_BUNDLE_GROUPS}"
+        ));
+    }
+    if bundle.items.len() > MAX_SYNC_BUNDLE_ITEMS {
+        return Err(format!(
+            "import contains too many items; the limit is {MAX_SYNC_BUNDLE_ITEMS}"
+        ));
+    }
+
+    let mut group_keys = HashSet::new();
+    for group in &mut bundle.groups {
+        let normalized = normalize_group(Some(&group.key))?;
+        if normalized != group.key {
+            return Err(format!(
+                "import group '{}' is not in canonical form",
+                group.key
+            ));
+        }
+        if !group_keys.insert(group.key.clone()) {
+            return Err(format!("import contains duplicate group '{}'", group.key));
+        }
+        validate_sync_time_range(
+            &format!("group '{}': createdAt", group.key),
+            group.created_at,
+        )?;
+        validate_sync_time_range(
+            &format!("group '{}': updatedAt", group.key),
+            group.updated_at,
+        )?;
+        if group.updated_at < group.created_at {
+            return Err(format!(
+                "import group '{}' was updated before it was created",
+                group.key
+            ));
+        }
+    }
+
+    let mut item_ids = HashSet::new();
+    let mut todo_entry_ids = HashSet::new();
+    for item in &mut bundle.items {
+        let parsed_id = uuid::Uuid::parse_str(&item.id)
+            .map_err(|_| format!("import item id '{}' is not a UUID", item.id))?;
+        item.id = parsed_id.to_string();
+        if !item_ids.insert(item.id.clone()) {
+            return Err(format!("import contains duplicate item id '{}'", item.id));
+        }
+        if item.kind == ItemKind::Secret {
+            return Err(format!(
+                "import item '{}' is a secret; private items are not supported by portable progress files",
+                item.id
+            ));
+        }
+
+        let normalized_group = normalize_group(Some(&item.group))?;
+        if normalized_group != item.group {
+            return Err(format!(
+                "import item '{}' has a non-canonical group",
+                item.id
+            ));
+        }
+        let normalized_title = normalize_title(&item.title);
+        if normalized_title != item.title {
+            return Err(format!(
+                "import item '{}' has an invalid or non-canonical title",
+                item.id
+            ));
+        }
+        let normalized_tags = normalize_tags(item.tags.clone());
+        if normalized_tags != item.tags {
+            return Err(format!(
+                "import item '{}' has invalid or duplicate tags",
+                item.id
+            ));
+        }
+        if item.todo_entries.len() > MAX_TODO_ENTRIES {
+            return Err(format!(
+                "import item '{}' has too many TODO entries; the limit is {MAX_TODO_ENTRIES}",
+                item.id
+            ));
+        }
+        if item.kind != ItemKind::Todo && !item.todo_entries.is_empty() {
+            return Err(format!(
+                "import item '{}' is not a TODO but contains checklist entries",
+                item.id
+            ));
+        }
+        validate_item_content(&item.title, &item.content, !item.todo_entries.is_empty())?;
+        validate_optional_timestamp_ms("dueAt", item.due_at)?;
+        validate_optional_timestamp_ms("expiresAt", item.expires_at)?;
+        validate_sync_time_range(&format!("item '{}': createdAt", item.id), item.created_at)?;
+        validate_sync_time_range(&format!("item '{}': updatedAt", item.id), item.updated_at)?;
+        if item.updated_at < item.created_at {
+            return Err(format!(
+                "import item '{}' was updated before it was created",
+                item.id
+            ));
+        }
+        if item.revision < 1 {
+            return Err(format!("import item '{}' has an invalid revision", item.id));
+        }
+        validate_status_timestamps(
+            &format!("import item '{}'", item.id),
+            item.status,
+            item.completed_at,
+            item.archived_at,
+            item.created_at,
+            item.updated_at,
+        )?;
+
+        let mut positions = HashSet::new();
+        for entry in &mut item.todo_entries {
+            let parsed_entry_id = uuid::Uuid::parse_str(&entry.id).map_err(|_| {
+                format!(
+                    "import TODO entry id '{}' in item '{}' is not a UUID",
+                    entry.id, item.id
+                )
+            })?;
+            entry.id = parsed_entry_id.to_string();
+            if !todo_entry_ids.insert(entry.id.clone()) {
+                return Err(format!(
+                    "import contains duplicate TODO entry id '{}'",
+                    entry.id
+                ));
+            }
+            let normalized_text = normalize_todo_entry_text(&entry.text)?;
+            if normalized_text != entry.text {
+                return Err(format!(
+                    "import TODO entry '{}' has non-canonical text",
+                    entry.id
+                ));
+            }
+            if entry.position < 0 || !positions.insert(entry.position) {
+                return Err(format!(
+                    "import item '{}' has an invalid or duplicate TODO position",
+                    item.id
+                ));
+            }
+            if entry.revision < 1 {
+                return Err(format!(
+                    "import TODO entry '{}' has an invalid revision",
+                    entry.id
+                ));
+            }
+            validate_sync_time_range(
+                &format!("TODO entry '{}': createdAt", entry.id),
+                entry.created_at,
+            )?;
+            validate_sync_time_range(
+                &format!("TODO entry '{}': updatedAt", entry.id),
+                entry.updated_at,
+            )?;
+            if entry.updated_at < entry.created_at {
+                return Err(format!(
+                    "import TODO entry '{}' was updated before it was created",
+                    entry.id
+                ));
+            }
+            validate_optional_timestamp_ms("TODO entry completedAt", entry.completed_at)?;
+            match (entry.is_completed, entry.completed_at) {
+                (true, Some(completed_at))
+                    if completed_at >= entry.created_at && completed_at <= entry.updated_at => {}
+                (false, None) => {}
+                _ => {
+                    return Err(format!(
+                        "import TODO entry '{}' has inconsistent completion metadata",
+                        entry.id
+                    ));
+                }
+            }
+        }
+        item.todo_entries
+            .sort_by_key(|entry| (entry.position, entry.created_at, entry.id.clone()));
+
+        if item.kind == ItemKind::Todo && item.status != ItemStatus::Archived {
+            let all_completed = !item.todo_entries.is_empty()
+                && item.todo_entries.iter().all(|entry| entry.is_completed);
+            if (item.status == ItemStatus::Completed) != all_completed
+                && !item.todo_entries.is_empty()
+            {
+                return Err(format!(
+                    "import TODO item '{}' has inconsistent parent and checklist status",
+                    item.id
+                ));
+            }
+        }
+    }
+
+    Ok(bundle)
+}
+
+fn validate_sync_time_range(label: &str, value: i64) -> Result<(), String> {
+    validate_optional_timestamp_ms(label, Some(value))
+}
+
+fn validate_status_timestamps(
+    label: &str,
+    status: ItemStatus,
+    completed_at: Option<i64>,
+    archived_at: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+) -> Result<(), String> {
+    validate_optional_timestamp_ms("completedAt", completed_at)?;
+    validate_optional_timestamp_ms("archivedAt", archived_at)?;
+    let valid = match status {
+        ItemStatus::Active => completed_at.is_none() && archived_at.is_none(),
+        ItemStatus::Completed => completed_at.is_some() && archived_at.is_none(),
+        ItemStatus::Archived => completed_at.is_none() && archived_at.is_some(),
+    };
+    if !valid {
+        return Err(format!("{label} has inconsistent status timestamps"));
+    }
+    for timestamp in [completed_at, archived_at].into_iter().flatten() {
+        if timestamp < created_at || timestamp > updated_at {
+            return Err(format!(
+                "{label} has a status timestamp outside its lifetime"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn normalize_initial_todo_entries(
     kind: ItemKind,
     entries: Vec<String>,
@@ -3020,6 +3654,21 @@ mod tests {
         }
     }
 
+    fn todo_input(group: &str, title: &str, entries: &[&str]) -> CreateItemInput {
+        CreateItemInput {
+            kind: ItemKind::Todo,
+            group: Some(group.to_string()),
+            title: title.to_string(),
+            content: "Portable checklist context".to_string(),
+            color: Some(ItemColor::Sky),
+            tags: vec!["portable".to_string()],
+            due_at: None,
+            expires_at: None,
+            mcp_access: Some(McpAccess::ReadWrite),
+            todo_entries: entries.iter().map(|entry| (*entry).to_string()).collect(),
+        }
+    }
+
     #[test]
     fn persisted_timestamps_stay_within_the_supported_date_range() {
         assert!(validate_optional_timestamp_ms("dueAt", None).is_ok());
@@ -3066,6 +3715,269 @@ mod tests {
             )
             .unwrap();
         assert!(!String::from_utf8_lossy(&ciphertext).contains("plain text must not leak"));
+    }
+
+    #[test]
+    fn sync_export_excludes_private_items_credentials_and_window_state() {
+        let store = store();
+        let note = store
+            .create_item(note_input("portable development progress"))
+            .unwrap();
+        store.set_window_visible(&note.id, true).unwrap();
+        store.set_window_pin(&note.id, false).unwrap();
+        let secret = store
+            .create_item(CreateItemInput {
+                kind: ItemKind::Secret,
+                group: Some("private".to_string()),
+                title: "Do not transfer".to_string(),
+                content: "secret-value-that-must-not-leak".to_string(),
+                color: None,
+                tags: vec![],
+                due_at: None,
+                expires_at: None,
+                mcp_access: None,
+                todo_entries: vec![],
+            })
+            .unwrap();
+        let client = store
+            .create_mcp_client(CreateMcpClientInput {
+                display_name: "Portable test agent".to_string(),
+                transport: McpTransport::LoopbackHttp,
+            })
+            .unwrap();
+
+        // Private rows are filtered before decryption, so a damaged private payload cannot leak
+        // into or unnecessarily block an ordinary progress export.
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE items SET content_ciphertext = X'00' WHERE id = ?1",
+                [&secret.id],
+            )
+            .unwrap();
+
+        let (bundle, summary) = store.export_sync_bundle().unwrap();
+        assert_eq!(summary.item_count, 1);
+        assert_eq!(summary.excluded_private_count, 1);
+        assert_eq!(bundle.items[0].id, note.id);
+        let encoded = serde_json::to_string(&bundle).unwrap();
+        assert!(encoded.contains("portable development progress"));
+        assert!(!encoded.contains("secret-value-that-must-not-leak"));
+        assert!(!encoded.contains(&client.bearer_token));
+        let item = serde_json::to_value(&bundle.items[0]).unwrap();
+        for excluded in ["sensitivity", "window", "alwaysOnTop", "backgroundOpacity"] {
+            assert!(!item.as_object().unwrap().contains_key(excluded));
+        }
+
+        let mut private_conflict = bundle;
+        private_conflict.items[0].id = secret.id;
+        private_conflict.items[0].revision = secret.revision + 1;
+        let outcome = store.import_sync_bundle(private_conflict).unwrap();
+        assert_eq!(outcome.summary.conflicts, 1);
+    }
+
+    #[test]
+    fn sync_bundle_round_trip_preserves_progress_but_resets_desktop_state() {
+        let source = store();
+        source
+            .create_group(CreateGroupInput {
+                group: "empty/portable".to_string(),
+            })
+            .unwrap();
+        let todo = source
+            .create_item(todo_input(
+                "project/portable",
+                "Move development plan",
+                &["Build export", "Import elsewhere"],
+            ))
+            .unwrap();
+        source.set_window_visible(&todo.id, true).unwrap();
+        source.set_window_pin(&todo.id, false).unwrap();
+        source
+            .set_window_opacity(WindowOpacityInput {
+                item_id: todo.id.clone(),
+                background_opacity: 0.45,
+                text_opacity: 0.7,
+            })
+            .unwrap();
+        let todo = source
+            .set_todo_entry_completed(SetTodoEntryCompletedInput {
+                item_id: todo.id.clone(),
+                entry_id: todo.todo_entries[0].id.clone(),
+                expected_item_revision: todo.revision,
+                expected_entry_revision: todo.todo_entries[0].revision,
+                is_completed: true,
+            })
+            .unwrap();
+        let archived = source.create_item(note_input("archived progress")).unwrap();
+        let archived = source
+            .set_status(SetStatusInput {
+                id: archived.id,
+                expected_revision: archived.revision,
+                status: ItemStatus::Archived,
+            })
+            .unwrap();
+
+        let source_ciphertext: Vec<u8> = source
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT content_ciphertext FROM items WHERE id = ?1",
+                [&todo.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (bundle, _) = source.export_sync_bundle().unwrap();
+        let destination =
+            Store::from_connection(Connection::open_in_memory().unwrap(), [8_u8; 32]).unwrap();
+        let outcome = destination.import_sync_bundle(bundle.clone()).unwrap();
+        assert_eq!(outcome.summary.groups_added, 2);
+        assert_eq!(outcome.summary.items_added, 2);
+        assert_eq!(outcome.summary.items_updated, 0);
+
+        let imported = destination.get_item(&todo.id).unwrap();
+        assert_eq!(imported.title, todo.title);
+        assert_eq!(imported.content, todo.content);
+        assert_eq!(imported.group, "project/portable");
+        assert_eq!(imported.status, ItemStatus::Active);
+        assert_eq!(imported.todo_entries, todo.todo_entries);
+        let window = imported.window.unwrap();
+        assert!(window.always_on_top);
+        assert!(!window.is_visible);
+        assert_eq!(window.background_opacity, 1.0);
+        assert_eq!(window.text_opacity, 1.0);
+        assert_eq!(
+            destination.get_item(&archived.id).unwrap().status,
+            ItemStatus::Archived
+        );
+        assert!(
+            destination
+                .list_groups()
+                .unwrap()
+                .iter()
+                .any(|group| group.key == "empty/portable" && group.item_count == 0)
+        );
+
+        let destination_ciphertext: Vec<u8> = destination
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT content_ciphertext FROM items WHERE id = ?1",
+                [&todo.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(source_ciphertext, destination_ciphertext);
+
+        let repeated = destination.import_sync_bundle(bundle).unwrap();
+        assert_eq!(repeated.summary.items_unchanged, 2);
+        assert_eq!(repeated.summary.items_added, 0);
+        assert_eq!(repeated.summary.items_updated, 0);
+    }
+
+    #[test]
+    fn sync_import_uses_revisions_and_preserves_divergent_local_work() {
+        let source = store();
+        let original = source.create_item(note_input("source v1")).unwrap();
+        let (v1_bundle, _) = source.export_sync_bundle().unwrap();
+        let destination =
+            Store::from_connection(Connection::open_in_memory().unwrap(), [8_u8; 32]).unwrap();
+        destination.import_sync_bundle(v1_bundle).unwrap();
+
+        let source_v2 = source
+            .update_item(UpdateItemInput {
+                id: original.id.clone(),
+                expected_revision: original.revision,
+                group: original.group.clone(),
+                title: original.title.clone(),
+                content: "source v2".to_string(),
+                color: original.color,
+                tags: original.tags.clone(),
+                due_at: original.due_at,
+                expires_at: original.expires_at,
+                todo_entries: None,
+            })
+            .unwrap();
+        let (v2_bundle, _) = source.export_sync_bundle().unwrap();
+        let updated = destination.import_sync_bundle(v2_bundle.clone()).unwrap();
+        assert_eq!(updated.summary.items_updated, 1);
+        assert_eq!(
+            destination.get_item(&original.id).unwrap().content,
+            "source v2"
+        );
+
+        let destination_v3 = destination
+            .update_item(UpdateItemInput {
+                id: source_v2.id.clone(),
+                expected_revision: source_v2.revision,
+                group: source_v2.group.clone(),
+                title: source_v2.title.clone(),
+                content: "destination v3".to_string(),
+                color: source_v2.color,
+                tags: source_v2.tags.clone(),
+                due_at: source_v2.due_at,
+                expires_at: source_v2.expires_at,
+                todo_entries: None,
+            })
+            .unwrap();
+        let older = destination.import_sync_bundle(v2_bundle.clone()).unwrap();
+        assert_eq!(older.summary.newer_local_items, 1);
+        assert_eq!(
+            destination.get_item(&original.id).unwrap().content,
+            "destination v3"
+        );
+
+        let mut divergent = v2_bundle;
+        divergent.items[0].revision = destination_v3.revision;
+        divergent.items[0].updated_at = destination_v3.updated_at;
+        let conflict = destination.import_sync_bundle(divergent).unwrap();
+        assert_eq!(conflict.summary.conflicts, 1);
+        assert_eq!(
+            destination.get_item(&original.id).unwrap().content,
+            "destination v3"
+        );
+    }
+
+    #[test]
+    fn sync_import_rejects_private_payloads_and_rolls_back_id_collisions() {
+        let source = store();
+        let imported = source
+            .create_item(todo_input(
+                "import/rollback",
+                "Should roll back",
+                &["Imported entry"],
+            ))
+            .unwrap();
+        let (mut bundle, _) = source.export_sync_bundle().unwrap();
+        let destination = store();
+        let local = destination
+            .create_item(todo_input("local", "Local checklist", &["Local entry"]))
+            .unwrap();
+
+        let mut private_bundle = bundle.clone();
+        private_bundle.items[0].kind = ItemKind::Secret;
+        let error = destination.import_sync_bundle(private_bundle).unwrap_err();
+        assert!(error.contains("private items are not supported"));
+
+        bundle.items[0].todo_entries[0].id = local.todo_entries[0].id.clone();
+        let error = destination.import_sync_bundle(bundle).unwrap_err();
+        assert!(error.contains("already belongs to another item"));
+        assert!(destination.get_item(&imported.id).is_err());
+        assert!(
+            destination
+                .list_groups()
+                .unwrap()
+                .iter()
+                .all(|group| group.key != "import/rollback")
+        );
+        assert_eq!(
+            destination.get_item(&local.id).unwrap().todo_entries,
+            local.todo_entries
+        );
     }
 
     #[test]
