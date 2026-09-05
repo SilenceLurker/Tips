@@ -1,22 +1,40 @@
+mod mcp_model;
+mod mcp_server;
 mod model;
+mod native_i18n;
 mod store;
 mod windowing;
 
 use std::{fs, io, path::PathBuf};
 
+use mcp_model::{
+    CreateMcpClientInput, McpClientView, McpGroupGrantView, McpGroupRole, McpTransport,
+    SetMcpGroupGrantInput,
+};
+use mcp_server::{McpRuntimeState, McpRuntimeStatus};
 use model::{
-    AddTodoEntryInput, CreateItemInput, DeleteTodoEntryInput, Item, SetStatusInput,
+    AddTodoEntryInput, CreateGroupInput, CreateItemInput, DeleteTodoEntryInput, GroupChangedEvent,
+    Item, ItemGroup, LocalePreference, RenameGroupInput, SetStatusInput,
     SetTodoEntryCompletedInput, ThemeMode, UpdateItemInput, UpdateTodoEntryInput,
     WindowOpacityInput, WindowState,
 };
 #[cfg(debug_assertions)]
 use model::{ItemColor, ItemKind, WindowGeometryInput};
+use serde::Serialize;
 use store::{Store, load_or_create_master_key};
 use tauri::{
     AppHandle, Emitter, Manager, State, WindowEvent,
     menu::{Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent, TrayIconId},
 };
+
+const TRAY_ID: &str = "main-tray";
+
+struct NativeUi {
+    show: MenuItem<tauri::Wry>,
+    quit: MenuItem<tauri::Wry>,
+    tray_id: TrayIconId,
+}
 
 #[tauri::command]
 fn list_items(
@@ -29,6 +47,50 @@ fn list_items(
 #[tauri::command]
 fn get_item(state: State<'_, Store>, id: String) -> Result<Item, String> {
     state.get_item(&id)
+}
+
+#[tauri::command]
+fn list_groups(state: State<'_, Store>) -> Result<Vec<ItemGroup>, String> {
+    state.list_groups()
+}
+
+#[tauri::command]
+fn create_group(
+    _main_window: MainWindowOnly,
+    app: AppHandle,
+    state: State<'_, Store>,
+    input: CreateGroupInput,
+) -> Result<ItemGroup, String> {
+    let group = state.create_group(input)?;
+    app.emit(
+        "groups-changed",
+        GroupChangedEvent {
+            previous_key: None,
+            group: group.clone(),
+        },
+    )
+    .map_err(|error| format!("notify group creation failed: {error}"))?;
+    Ok(group)
+}
+
+#[tauri::command]
+fn rename_group(
+    _main_window: MainWindowOnly,
+    app: AppHandle,
+    state: State<'_, Store>,
+    input: RenameGroupInput,
+) -> Result<ItemGroup, String> {
+    let previous_key = input.group.trim().to_lowercase();
+    let group = state.rename_group(input)?;
+    app.emit(
+        "groups-changed",
+        GroupChangedEvent {
+            previous_key: Some(previous_key),
+            group: group.clone(),
+        },
+    )
+    .map_err(|error| format!("notify group rename failed: {error}"))?;
+    Ok(group)
 }
 
 #[tauri::command]
@@ -61,7 +123,14 @@ fn set_item_status(
     state: State<'_, Store>,
     input: SetStatusInput,
 ) -> Result<Item, String> {
-    let item = state.set_status(input)?;
+    let mut item = state.set_status(input)?;
+    if item.status == model::ItemStatus::Archived {
+        if let Err(error) = windowing::hide_sticky(&app, &state, &item.id) {
+            eprintln!("hide sticky window after archive failed: {error}");
+        } else {
+            item = state.get_item(&item.id)?;
+        }
+    }
     app.emit("items-changed", &item)
         .map_err(|error| format!("notify status update failed: {error}"))?;
     Ok(item)
@@ -171,6 +240,154 @@ fn set_theme(
     Ok(theme)
 }
 
+#[tauri::command]
+fn get_locale(state: State<'_, Store>) -> Result<LocalePreference, String> {
+    state.get_locale()
+}
+
+#[tauri::command]
+fn set_locale(
+    app: AppHandle,
+    state: State<'_, Store>,
+    locale: LocalePreference,
+) -> Result<LocalePreference, String> {
+    let locale = state.set_locale(locale)?;
+    apply_native_locale(&app, locale);
+    if let Err(error) = app.emit("locale-changed", &locale) {
+        eprintln!("notify locale update failed after persistence: {error}");
+    }
+    Ok(locale)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProvisionedMcpClient {
+    client: McpClientView,
+    bearer_token: String,
+    grant: McpGroupGrantView,
+    endpoint: String,
+}
+
+#[tauri::command]
+fn get_mcp_runtime_status(state: State<'_, McpRuntimeState>) -> McpRuntimeStatus {
+    state.snapshot()
+}
+
+struct MainWindowOnly;
+
+impl<'de, R: tauri::Runtime> tauri::ipc::CommandArg<'de, R> for MainWindowOnly {
+    fn from_command(
+        command: tauri::ipc::CommandItem<'de, R>,
+    ) -> Result<Self, tauri::ipc::InvokeError> {
+        if command.message.webview_ref().label() != "main" {
+            return Err("this operation is only available from the main window".into());
+        }
+        Ok(Self)
+    }
+}
+
+#[tauri::command]
+fn list_mcp_clients(
+    _main_window: MainWindowOnly,
+    state: State<'_, Store>,
+) -> Result<Vec<McpClientView>, String> {
+    state.list_mcp_clients(false)
+}
+
+#[tauri::command]
+fn list_mcp_group_grants(
+    _main_window: MainWindowOnly,
+    state: State<'_, Store>,
+) -> Result<Vec<McpGroupGrantView>, String> {
+    state.list_mcp_group_grants(None, false)
+}
+
+#[tauri::command]
+fn set_mcp_group_grant(
+    _main_window: MainWindowOnly,
+    state: State<'_, Store>,
+    client_id: String,
+    group_name: String,
+    role: McpGroupRole,
+) -> Result<McpGroupGrantView, String> {
+    state.set_mcp_group_grant(SetMcpGroupGrantInput {
+        client_id,
+        group: group_name,
+        role,
+    })
+}
+
+#[tauri::command]
+fn set_mcp_group_management(
+    _main_window: MainWindowOnly,
+    state: State<'_, Store>,
+    client_id: String,
+    allowed: bool,
+) -> Result<(), String> {
+    state.set_mcp_group_management(&client_id, allowed)
+}
+
+#[tauri::command]
+fn provision_mcp_client(
+    _main_window: MainWindowOnly,
+    state: State<'_, Store>,
+    runtime: State<'_, McpRuntimeState>,
+    display_name: String,
+    group_name: String,
+    role: McpGroupRole,
+    can_manage_groups: Option<bool>,
+) -> Result<ProvisionedMcpClient, String> {
+    let mut created = state.create_mcp_client(CreateMcpClientInput {
+        display_name,
+        transport: McpTransport::LoopbackHttp,
+    })?;
+    let grant = match state.set_mcp_group_grant(SetMcpGroupGrantInput {
+        client_id: created.client.id.clone(),
+        group: group_name,
+        role,
+    }) {
+        Ok(grant) => grant,
+        Err(error) => {
+            let _ = state.revoke_mcp_client(&created.client.id);
+            return Err(error);
+        }
+    };
+    if can_manage_groups.unwrap_or(false) {
+        if let Err(error) = state.set_mcp_group_management(&created.client.id, true) {
+            let _ = state.revoke_mcp_group_grant(&created.client.id, &grant.group);
+            let _ = state.revoke_mcp_client(&created.client.id);
+            return Err(error);
+        }
+        created.client.can_manage_groups = true;
+    }
+
+    Ok(ProvisionedMcpClient {
+        client: created.client,
+        bearer_token: created.bearer_token,
+        grant,
+        endpoint: runtime.snapshot().endpoint,
+    })
+}
+
+#[tauri::command]
+fn revoke_mcp_client(
+    _main_window: MainWindowOnly,
+    state: State<'_, Store>,
+    client_id: String,
+) -> Result<(), String> {
+    state.revoke_mcp_client(&client_id)
+}
+
+#[tauri::command]
+fn revoke_mcp_group_grant(
+    _main_window: MainWindowOnly,
+    state: State<'_, Store>,
+    client_id: String,
+    group_name: String,
+) -> Result<(), String> {
+    state.revoke_mcp_group_grant(&client_id, &group_name)
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
@@ -179,13 +396,14 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "显示主面板", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出 Tips", true, None::<&str>)?;
+fn build_tray(app: &mut tauri::App, locale: LocalePreference) -> tauri::Result<()> {
+    let texts = native_i18n::texts_for_preference(locale);
+    let show = MenuItem::with_id(app, "show", texts.tray_show, true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", texts.tray_quit, true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
 
-    let mut builder = TrayIconBuilder::new()
-        .tooltip("Tips · 本地便签")
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
+        .tooltip(texts.tray_tooltip)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -209,8 +427,49 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
     if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
     }
-    builder.build(app)?;
+    let tray = builder.build(app)?;
+    app.manage(NativeUi {
+        show,
+        quit,
+        tray_id: tray.id().clone(),
+    });
     Ok(())
+}
+
+fn apply_native_locale(app: &AppHandle, locale: LocalePreference) {
+    let texts = native_i18n::texts_for_preference(locale);
+    if let Some(window) = app.get_webview_window("main") {
+        if let Err(error) = window.set_title(texts.main_title) {
+            eprintln!("update main window title failed after locale persistence: {error}");
+        }
+    }
+    if let Some(store) = app.try_state::<Store>() {
+        if let Ok(items) = store.list_items(false) {
+            for item in items.into_iter().filter(|item| item.title.is_empty()) {
+                let label = windowing::sticky_label(&item.id);
+                if let Some(window) = app.get_webview_window(&label) {
+                    if let Err(error) = window.set_title(texts.sticky_fallback_title) {
+                        eprintln!(
+                            "update sticky window title failed after locale persistence: {error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if let Some(native_ui) = app.try_state::<NativeUi>() {
+        if let Err(error) = native_ui.show.set_text(texts.tray_show) {
+            eprintln!("update tray show text failed after locale persistence: {error}");
+        }
+        if let Err(error) = native_ui.quit.set_text(texts.tray_quit) {
+            eprintln!("update tray quit text failed after locale persistence: {error}");
+        }
+        if let Some(tray) = app.tray_by_id(&native_ui.tray_id) {
+            if let Err(error) = tray.set_tooltip(Some(texts.tray_tooltip)) {
+                eprintln!("update tray tooltip failed after locale persistence: {error}");
+            }
+        }
+    }
 }
 
 fn resolve_data_dir(app: &tauri::App) -> Result<PathBuf, io::Error> {
@@ -287,7 +546,13 @@ fn is_allowed_navigation(url: &tauri::Url, allow_dev_server: bool) -> bool {
 }
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        show_main_window(app);
+    }));
+
+    builder
         .plugin(
             tauri::plugin::Builder::<_, ()>::new("navigation-guard")
                 .on_navigation(|_webview, url| is_allowed_navigation(url, cfg!(debug_assertions)))
@@ -299,8 +564,20 @@ pub fn run() {
             let key = load_or_create_master_key().map_err(io::Error::other)?;
             let store =
                 Store::open(&data_dir.join("tips.sqlite3"), key).map_err(io::Error::other)?;
+            app.manage(McpRuntimeState::default());
             app.manage(store);
-            build_tray(app)?;
+            let locale = app
+                .state::<Store>()
+                .get_locale()
+                .map_err(io::Error::other)?;
+            build_tray(app, locale)?;
+            apply_native_locale(app.handle(), locale);
+
+            let mcp_config = app
+                .state::<Store>()
+                .get_mcp_server_config()
+                .map_err(io::Error::other)?;
+            mcp_server::spawn(app.handle().clone(), mcp_config);
 
             let state = app.state::<Store>();
             windowing::restore_visible_windows(app.handle(), &state);
@@ -320,6 +597,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_items,
             get_item,
+            list_groups,
+            create_group,
+            rename_group,
             create_item,
             update_item,
             set_item_status,
@@ -333,6 +613,16 @@ pub fn run() {
             set_sticky_opacity,
             get_theme,
             set_theme,
+            get_locale,
+            set_locale,
+            get_mcp_runtime_status,
+            list_mcp_clients,
+            list_mcp_group_grants,
+            set_mcp_group_grant,
+            set_mcp_group_management,
+            provision_mcp_client,
+            revoke_mcp_client,
+            revoke_mcp_group_grant,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tips");

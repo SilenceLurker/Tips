@@ -1,13 +1,34 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   CreateItemInput,
+  ItemGroup,
   Item,
   ItemStatus,
+  LocalePreference,
+  McpClient,
+  McpGroupGrant,
+  McpRuntimeStatus,
+  ProvisionMcpClientInput,
+  ProvisionedMcpClient,
   ThemeMode,
   TodoEntry,
   UpdateItemInput,
   WindowState,
 } from "./types";
+
+export const groupsApi = {
+  list() {
+    return invoke<ItemGroup[]>("list_groups");
+  },
+
+  create(group: string) {
+    return invoke<ItemGroup>("create_group", { input: { group } });
+  },
+
+  rename(group: string, newGroup: string) {
+    return invoke<ItemGroup>("rename_group", { input: { group, newGroup } });
+  },
+};
 
 export const itemsApi = {
   list(includeArchived = false) {
@@ -112,10 +133,61 @@ export const settingsApi = {
   setTheme(theme: ThemeMode) {
     return invoke<ThemeMode>("set_theme", { theme });
   },
+
+  getLocale() {
+    return invoke<LocalePreference>("get_locale");
+  },
+
+  setLocale(locale: LocalePreference) {
+    return invoke<LocalePreference>("set_locale", { locale });
+  },
 };
 
-export function errorMessage(error: unknown): string {
+export const mcpApi = {
+  getRuntimeStatus() {
+    return invoke<McpRuntimeStatus>("get_mcp_runtime_status");
+  },
+
+  listClients() {
+    return invoke<McpClient[]>("list_mcp_clients");
+  },
+
+  listGroupGrants() {
+    return invoke<McpGroupGrant[]>("list_mcp_group_grants");
+  },
+
+  setGroupGrant(clientId: string, groupName: string, role: McpGroupGrant["role"]) {
+    return invoke<McpGroupGrant>("set_mcp_group_grant", {
+      clientId,
+      groupName,
+      role,
+    });
+  },
+
+  setGroupManagement(clientId: string, allowed: boolean) {
+    return invoke<void>("set_mcp_group_management", { clientId, allowed });
+  },
+
+  provisionClient(input: ProvisionMcpClientInput) {
+    return invoke<ProvisionedMcpClient>("provision_mcp_client", {
+      displayName: input.displayName,
+      groupName: input.groupName,
+      role: input.role,
+      canManageGroups: input.canManageGroups,
+    });
+  },
+
+  revokeClient(clientId: string) {
+    return invoke<void>("revoke_mcp_client", { clientId });
+  },
+
+  revokeGroupGrant(clientId: string, groupName: string) {
+    return invoke<void>("revoke_mcp_group_grant", { clientId, groupName });
+  },
+};
+
+export function errorMessage(error: unknown, fallback = "An unknown error occurred"): string {
   if (typeof error === "string") return error;
   if (error instanceof Error) return error.message;
-  return "发生了未知错误";
+  return fallback;
 }

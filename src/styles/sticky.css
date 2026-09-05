@@ -26,6 +26,11 @@
   box-shadow: inset 0 1px rgba(255,255,255,.25);
 }
 
+.sticky-note.is-hiding {
+  cursor: wait;
+  user-select: none;
+}
+
 .sticky-note::before {
   position: absolute;
   z-index: 0;

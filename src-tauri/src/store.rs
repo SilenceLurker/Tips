@@ -10,26 +10,41 @@ use chacha20poly1305::{
     aead::{Aead, Generate, KeyInit, Payload},
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use sha2::{Digest, Sha256};
 
+use crate::mcp_model::{
+    CreateMcpClientInput, CreatedMcpClient, McpClientView, McpCreateGroupInput, McpCreateItemInput,
+    McpGroupGrantView, McpGroupRole, McpItemView, McpListItemsInput, McpMoveItemInput,
+    McpPrincipal, McpRenameGroupInput, McpServerConfig, McpSetStatusInput,
+    McpSetTodoEntryCompletedInput, McpTodoEntryDraftInput, McpTodoEntryView, McpTransport,
+    McpUpdateItemInput, SetMcpGroupGrantInput,
+};
 use crate::model::{
-    AddTodoEntryInput, CreateItemInput, DeleteTodoEntryInput, Item, ItemColor, ItemKind,
-    ItemStatus, McpAccess, Sensitivity, SetStatusInput, SetTodoEntryCompletedInput, ThemeMode,
-    TodoEntry, TodoEntryDraftInput, UpdateItemInput, UpdateTodoEntryInput, WindowGeometryInput,
-    WindowOpacityInput, WindowState,
+    AddTodoEntryInput, CreateGroupInput, CreateItemInput, DeleteTodoEntryInput, Item, ItemColor,
+    ItemGroup, ItemKind, ItemStatus, LocalePreference, McpAccess, RenameGroupInput, Sensitivity,
+    SetStatusInput, SetTodoEntryCompletedInput, ThemeMode, TodoEntry, TodoEntryDraftInput,
+    UpdateItemInput, UpdateTodoEntryInput, WindowGeometryInput, WindowOpacityInput, WindowState,
 };
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const WINDOW_OPACITY_MIGRATION: &str = include_str!("../migrations/002_window_opacity.sql");
 const TODO_ENTRIES_MIGRATION: &str = include_str!("../migrations/003_todo_entries.sql");
 const ITEM_GROUPS_MIGRATION: &str = include_str!("../migrations/004_item_groups.sql");
-const LATEST_SCHEMA_VERSION: i64 = 4;
+const MCP_V1_MIGRATION: &str = include_str!("../migrations/005_mcp_v1.sql");
+const PERSISTENT_GROUPS_MIGRATION: &str = include_str!("../migrations/006_persistent_groups.sql");
+const LATEST_SCHEMA_VERSION: i64 = 6;
 const MAX_TITLE_CHARS: usize = 160;
 const MAX_GROUP_CHARS: usize = 96;
 const MAX_CONTENT_BYTES: usize = 1024 * 1024;
 const MAX_TODO_ENTRIES: usize = 200;
 const MAX_TODO_ENTRY_CHARS: usize = 500;
+const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_999;
 const DEFAULT_SECRET_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+const LOCALE_SETTING_KEY: &str = "appearance.locale";
 const THEME_SETTING_KEY: &str = "appearance.theme";
+const MCP_SERVER_SETTING_KEY: &str = "mcp.server";
+const MCP_GROUP_MANAGEMENT_SCOPE: &str = "groups:manage";
+const MAX_MCP_LIST_ITEMS: u32 = 200;
 
 const ITEM_SELECT: &str = r#"
 SELECT
@@ -64,6 +79,25 @@ SELECT
     w.updated_at
 FROM items i
 LEFT JOIN item_windows w ON w.item_id = i.id
+"#;
+
+const MCP_ITEM_SELECT: &str = r#"
+SELECT
+    i.id,
+    i.kind,
+    i.group_key,
+    i.title,
+    i.content_ciphertext,
+    i.content_nonce,
+    i.status,
+    i.tags_json,
+    i.due_at,
+    i.completed_at,
+    i.revision,
+    i.created_at,
+    i.updated_at,
+    i.archived_at
+FROM items i
 "#;
 
 pub struct Store {
@@ -114,6 +148,23 @@ struct StoredTodoEntry {
     created_at: i64,
     updated_at: i64,
     completed_at: Option<i64>,
+}
+
+struct StoredMcpItem {
+    id: String,
+    kind: String,
+    group_key: String,
+    title: String,
+    ciphertext: Vec<u8>,
+    nonce: Vec<u8>,
+    status: String,
+    tags_json: String,
+    due_at: Option<i64>,
+    completed_at: Option<i64>,
+    revision: i64,
+    created_at: i64,
+    updated_at: i64,
+    archived_at: Option<i64>,
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), String> {
@@ -188,6 +239,40 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
         transaction
             .commit()
             .map_err(|error| format!("commit item groups migration failed: {error}"))?;
+        version = 4;
+    }
+
+    if version == 4 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("start MCP v1 migration failed: {error}"))?;
+        transaction
+            .execute_batch(MCP_V1_MIGRATION)
+            .map_err(|error| format!("MCP v1 migration failed: {error}"))?;
+        transaction
+            .pragma_update(None, "user_version", 5_i64)
+            .map_err(|error| format!("record MCP v1 migration version failed: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit MCP v1 migration failed: {error}"))?;
+        version = 5;
+    }
+
+    if version == 5 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("start persistent groups migration failed: {error}"))?;
+        transaction
+            .execute_batch(PERSISTENT_GROUPS_MIGRATION)
+            .map_err(|error| format!("persistent groups migration failed: {error}"))?;
+        transaction
+            .pragma_update(None, "user_version", 6_i64)
+            .map_err(|error| {
+                format!("record persistent groups migration version failed: {error}")
+            })?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit persistent groups migration failed: {error}"))?;
     }
 
     Ok(())
@@ -215,6 +300,938 @@ impl Store {
             connection: Mutex::new(connection),
             key,
         })
+    }
+
+    pub fn create_mcp_client(
+        &self,
+        input: CreateMcpClientInput,
+    ) -> Result<CreatedMcpClient, String> {
+        let display_name = input.display_name.trim();
+        if display_name.is_empty() {
+            return Err("MCP client display name cannot be empty".to_string());
+        }
+        if display_name.chars().count() > 80 {
+            return Err("MCP client display name cannot exceed 80 characters".to_string());
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let bearer_token = format!(
+            "tips_{id}_{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let token_hash = hash_mcp_token(&bearer_token);
+        let now = now_ms();
+        self.lock()?
+            .execute(
+                r#"
+                INSERT INTO mcp_clients (
+                    id, display_name, transport, token_hash, scopes_json,
+                    created_at, last_used_at, revoked_at
+                ) VALUES (?1, ?2, ?3, ?4, '[]', ?5, NULL, NULL)
+                "#,
+                params![id, display_name, input.transport.as_str(), token_hash, now],
+            )
+            .map_err(|error| format!("create MCP client failed: {error}"))?;
+
+        Ok(CreatedMcpClient {
+            client: McpClientView {
+                id,
+                display_name: display_name.to_string(),
+                transport: input.transport,
+                can_manage_groups: false,
+                created_at: now,
+                last_used_at: None,
+                revoked_at: None,
+            },
+            bearer_token,
+        })
+    }
+
+    pub fn authenticate_mcp_client(
+        &self,
+        bearer_token: &str,
+        transport: McpTransport,
+    ) -> Result<McpPrincipal, String> {
+        let client_id = parse_mcp_client_id(bearer_token)
+            .ok_or_else(|| "invalid MCP client credentials".to_string())?;
+        let candidate_hash = hash_mcp_token(bearer_token);
+        let connection = self.lock()?;
+        let stored = connection
+            .query_row(
+                r#"
+                SELECT display_name, transport, token_hash
+                FROM mcp_clients
+                WHERE id = ?1 AND revoked_at IS NULL AND token_hash IS NOT NULL
+                "#,
+                [&client_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("authenticate MCP client failed: {error}"))?
+            .ok_or_else(|| "invalid MCP client credentials".to_string())?;
+
+        if !constant_time_eq(&stored.2, &candidate_hash) || stored.1 != transport.as_str() {
+            return Err("invalid MCP client credentials".to_string());
+        }
+
+        connection
+            .execute(
+                "UPDATE mcp_clients SET last_used_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
+                params![now_ms(), client_id],
+            )
+            .map_err(|error| format!("record MCP client use failed: {error}"))?;
+
+        Ok(McpPrincipal {
+            client_id,
+            display_name: stored.0,
+            transport,
+        })
+    }
+
+    pub fn list_mcp_clients(&self, include_revoked: bool) -> Result<Vec<McpClientView>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT id, display_name, transport, scopes_json, created_at, last_used_at, revoked_at
+                FROM mcp_clients
+                WHERE ?1 = 1 OR revoked_at IS NULL
+                ORDER BY revoked_at IS NOT NULL, display_name COLLATE NOCASE, id
+                "#,
+            )
+            .map_err(|error| format!("prepare MCP client list failed: {error}"))?;
+        let rows = statement
+            .query_map([bool_to_int(include_revoked)], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            })
+            .map_err(|error| format!("query MCP client list failed: {error}"))?;
+        rows.map(|row| {
+            let (id, display_name, transport, scopes_json, created_at, last_used_at, revoked_at) =
+                row.map_err(|error| format!("read MCP client failed: {error}"))?;
+            Ok(McpClientView {
+                id,
+                display_name,
+                transport: McpTransport::from_db(&transport)?,
+                can_manage_groups: mcp_scope_enabled(&scopes_json, MCP_GROUP_MANAGEMENT_SCOPE)?,
+                created_at,
+                last_used_at,
+                revoked_at,
+            })
+        })
+        .collect()
+    }
+
+    pub fn set_mcp_group_management(&self, client_id: &str, allowed: bool) -> Result<(), String> {
+        let connection = self.lock()?;
+        let scopes_json = connection
+            .query_row(
+                "SELECT scopes_json FROM mcp_clients WHERE id = ?1 AND revoked_at IS NULL",
+                [client_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("read MCP client capabilities failed: {error}"))?
+            .ok_or_else(|| "active MCP client not found".to_string())?;
+        let mut scopes = parse_mcp_scopes(&scopes_json)?;
+        if allowed {
+            if !scopes
+                .iter()
+                .any(|scope| scope == MCP_GROUP_MANAGEMENT_SCOPE)
+            {
+                scopes.push(MCP_GROUP_MANAGEMENT_SCOPE.to_string());
+            }
+        } else {
+            scopes.retain(|scope| scope != MCP_GROUP_MANAGEMENT_SCOPE);
+        }
+        scopes.sort();
+        scopes.dedup();
+        let scopes_json = serde_json::to_string(&scopes)
+            .map_err(|error| format!("encode MCP client capabilities failed: {error}"))?;
+        connection
+            .execute(
+                "UPDATE mcp_clients SET scopes_json = ?1 WHERE id = ?2 AND revoked_at IS NULL",
+                params![scopes_json, client_id],
+            )
+            .map_err(|error| format!("update MCP client capabilities failed: {error}"))?;
+        Ok(())
+    }
+
+    pub fn revoke_mcp_client(&self, client_id: &str) -> Result<(), String> {
+        let changed = self
+            .lock()?
+            .execute(
+                "UPDATE mcp_clients SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
+                params![now_ms(), client_id],
+            )
+            .map_err(|error| format!("revoke MCP client failed: {error}"))?;
+        if changed == 0 {
+            return Err("active MCP client not found".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn list_groups(&self) -> Result<Vec<ItemGroup>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT
+                    g.group_key,
+                    COUNT(i.id),
+                    COALESCE(SUM(CASE WHEN i.status <> 'archived' THEN 1 ELSE 0 END), 0),
+                    g.created_at,
+                    g.updated_at
+                FROM item_groups g
+                LEFT JOIN items i ON i.group_key = g.group_key
+                GROUP BY g.group_key, g.created_at, g.updated_at
+                ORDER BY CASE WHEN g.group_key = 'inbox' THEN 0 ELSE 1 END,
+                         g.group_key COLLATE NOCASE
+                "#,
+            )
+            .map_err(|error| format!("prepare group list failed: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(ItemGroup {
+                    key: row.get(0)?,
+                    item_count: row.get(1)?,
+                    visible_item_count: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })
+            .map_err(|error| format!("query groups failed: {error}"))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| format!("read group failed: {error}"))
+    }
+
+    pub fn create_group(&self, input: CreateGroupInput) -> Result<ItemGroup, String> {
+        let group = normalize_group(Some(&input.group))?;
+        let now = now_ms();
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("start group creation failed: {error}"))?;
+        Self::insert_group(&transaction, &group, now)?;
+        let result = Self::get_group_with_connection(&transaction, &group)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit group creation failed: {error}"))?;
+        Ok(result)
+    }
+
+    pub fn rename_group(&self, input: RenameGroupInput) -> Result<ItemGroup, String> {
+        let group = normalize_group(Some(&input.group))?;
+        let new_group = normalize_group(Some(&input.new_group))?;
+        let now = now_ms();
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("start group rename failed: {error}"))?;
+        Self::rename_group_in_transaction(&transaction, &group, &new_group, now)?;
+        let result = Self::get_group_with_connection(&transaction, &new_group)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit group rename failed: {error}"))?;
+        Ok(result)
+    }
+
+    pub fn mcp_create_group(
+        &self,
+        client_id: &str,
+        input: McpCreateGroupInput,
+    ) -> Result<ItemGroup, String> {
+        let group = normalize_group(Some(&input.group))?;
+        let now = now_ms();
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("start MCP group creation failed: {error}"))?;
+        Self::assert_mcp_group_management(&transaction, client_id)?;
+        Self::insert_group(&transaction, &group, now)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO mcp_group_grants (client_id, group_key, role, created_at, revoked_at)
+                VALUES (?1, ?2, 'coordinator', ?3, NULL)
+                ON CONFLICT(client_id, group_key) DO UPDATE SET
+                    role = 'coordinator',
+                    created_at = excluded.created_at,
+                    revoked_at = NULL
+                "#,
+                params![client_id, group, now],
+            )
+            .map_err(|error| {
+                format!("grant MCP coordinator access to new group failed: {error}")
+            })?;
+        let result = Self::get_group_with_connection(&transaction, &group)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit MCP group creation failed: {error}"))?;
+        Ok(result)
+    }
+
+    pub fn mcp_rename_group(
+        &self,
+        client_id: &str,
+        input: McpRenameGroupInput,
+    ) -> Result<ItemGroup, String> {
+        let group = normalize_group(Some(&input.group))?;
+        let new_group = normalize_group(Some(&input.new_group))?;
+        let now = now_ms();
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("start MCP group rename failed: {error}"))?;
+        Self::assert_mcp_group_management(&transaction, client_id)?;
+        Self::assert_mcp_group_coordinator(&transaction, client_id, &group)?;
+        Self::rename_group_in_transaction(&transaction, &group, &new_group, now)?;
+        let result = Self::get_group_with_connection(&transaction, &new_group)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit MCP group rename failed: {error}"))?;
+        Ok(result)
+    }
+
+    pub fn set_mcp_group_grant(
+        &self,
+        input: SetMcpGroupGrantInput,
+    ) -> Result<McpGroupGrantView, String> {
+        let group = normalize_group(Some(&input.group))?;
+        let now = now_ms();
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("start MCP group grant update failed: {error}"))?;
+        let client_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mcp_clients WHERE id = ?1 AND revoked_at IS NULL)",
+                [&input.client_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("validate MCP client failed: {error}"))?;
+        if !client_exists {
+            return Err("active MCP client not found".to_string());
+        }
+        Self::ensure_group(&transaction, &group, now)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO mcp_group_grants (client_id, group_key, role, created_at, revoked_at)
+                VALUES (?1, ?2, ?3, ?4, NULL)
+                ON CONFLICT(client_id, group_key) DO UPDATE SET
+                    role = excluded.role,
+                    created_at = excluded.created_at,
+                    revoked_at = NULL
+                "#,
+                params![input.client_id, group, input.role.as_str(), now],
+            )
+            .map_err(|error| format!("save MCP group grant failed: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit MCP group grant failed: {error}"))?;
+        Ok(McpGroupGrantView {
+            client_id: input.client_id,
+            group,
+            role: input.role,
+            created_at: now,
+            revoked_at: None,
+        })
+    }
+
+    pub fn list_mcp_group_grants(
+        &self,
+        client_id: Option<&str>,
+        include_revoked: bool,
+    ) -> Result<Vec<McpGroupGrantView>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT client_id, group_key, role, created_at, revoked_at
+                FROM mcp_group_grants
+                WHERE (?1 IS NULL OR client_id = ?1)
+                  AND (?2 = 1 OR revoked_at IS NULL)
+                ORDER BY group_key, client_id
+                "#,
+            )
+            .map_err(|error| format!("prepare MCP group grant list failed: {error}"))?;
+        let rows = statement
+            .query_map(params![client_id, bool_to_int(include_revoked)], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .map_err(|error| format!("query MCP group grants failed: {error}"))?;
+        rows.map(|row| {
+            let (client_id, group, role, created_at, revoked_at) =
+                row.map_err(|error| format!("read MCP group grant failed: {error}"))?;
+            Ok(McpGroupGrantView {
+                client_id,
+                group,
+                role: McpGroupRole::from_db(&role)?,
+                created_at,
+                revoked_at,
+            })
+        })
+        .collect()
+    }
+
+    pub fn mcp_list_groups(&self, client_id: &str) -> Result<Vec<String>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT g.group_key
+                FROM mcp_group_grants g
+                JOIN item_groups ig ON ig.group_key = g.group_key
+                JOIN mcp_clients c ON c.id = g.client_id
+                WHERE g.client_id = ?1
+                  AND g.revoked_at IS NULL
+                  AND c.revoked_at IS NULL
+                ORDER BY g.group_key
+                "#,
+            )
+            .map_err(|error| format!("prepare MCP group list failed: {error}"))?;
+        let rows = statement
+            .query_map([client_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("query MCP group list failed: {error}"))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| format!("read MCP group failed: {error}"))
+    }
+
+    pub fn revoke_mcp_group_grant(&self, client_id: &str, group: &str) -> Result<(), String> {
+        let group = normalize_group(Some(group))?;
+        let changed = self
+            .lock()?
+            .execute(
+                r#"
+                UPDATE mcp_group_grants
+                SET revoked_at = ?1
+                WHERE client_id = ?2 AND group_key = ?3 AND revoked_at IS NULL
+                "#,
+                params![now_ms(), client_id, group],
+            )
+            .map_err(|error| format!("revoke MCP group grant failed: {error}"))?;
+        if changed == 0 {
+            return Err("active MCP group grant not found".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn get_mcp_server_config(&self) -> Result<McpServerConfig, String> {
+        let value = self
+            .lock()?
+            .query_row(
+                "SELECT value_json FROM settings WHERE key = ?1",
+                [MCP_SERVER_SETTING_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("read MCP server setting failed: {error}"))?;
+        match value {
+            Some(value) => serde_json::from_str(&value)
+                .map_err(|error| format!("decode MCP server setting failed: {error}")),
+            None => Ok(McpServerConfig::default()),
+        }
+    }
+
+    pub fn mcp_list_items(
+        &self,
+        client_id: &str,
+        input: McpListItemsInput,
+    ) -> Result<Vec<McpItemView>, String> {
+        let group = normalize_group(Some(&input.group))?;
+        let kind = input.kind.map(|value| value.as_str().to_string());
+        let status = input.status.map(|value| value.as_str().to_string());
+        let limit = i64::from(input.limit.unwrap_or(100).clamp(1, MAX_MCP_LIST_ITEMS));
+        let sql = format!(
+            r#"
+            {MCP_ITEM_SELECT}
+            WHERE i.group_key = ?1
+              AND (?2 IS NULL OR i.kind = ?2)
+              AND (?3 IS NULL OR i.status = ?3)
+              AND (?3 IS NOT NULL OR i.status <> 'archived')
+              AND (?4 IS NULL OR i.updated_at > ?4)
+              AND i.kind IN ('note', 'todo')
+              AND i.sensitivity = 'standard'
+              AND i.mcp_access <> 'deny'
+              AND EXISTS (
+                  SELECT 1
+                  FROM mcp_group_grants g
+                  JOIN mcp_clients c ON c.id = g.client_id
+                  WHERE g.client_id = ?5
+                    AND g.group_key = i.group_key
+                    AND g.revoked_at IS NULL
+                    AND c.revoked_at IS NULL
+              )
+            ORDER BY i.updated_at DESC, i.id
+            LIMIT ?6
+            "#
+        );
+        let connection = self.lock()?;
+        let stored_items = {
+            let mut statement = connection
+                .prepare(&sql)
+                .map_err(|error| format!("prepare MCP item list failed: {error}"))?;
+            let rows = statement
+                .query_map(
+                    params![group, kind, status, input.updated_after, client_id, limit,],
+                    Self::read_stored_mcp_item,
+                )
+                .map_err(|error| format!("query MCP item list failed: {error}"))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| format!("read MCP item failed: {error}"))?
+        };
+
+        stored_items
+            .into_iter()
+            .map(|stored| self.decrypt_mcp_item(&connection, stored))
+            .collect()
+    }
+
+    pub fn mcp_get_item(&self, client_id: &str, item_id: &str) -> Result<McpItemView, String> {
+        let connection = self.lock()?;
+        self.get_mcp_item_with_connection(&connection, client_id, item_id)
+    }
+
+    pub fn mcp_create_item(
+        &self,
+        client_id: &str,
+        input: McpCreateItemInput,
+    ) -> Result<McpItemView, String> {
+        if input.kind == ItemKind::Secret {
+            return Err("MCP cannot create secret items".to_string());
+        }
+        validate_optional_timestamp_ms("dueAt", input.due_at)?;
+        let group = normalize_group(Some(&input.group))?;
+        let todo_entries = normalize_initial_todo_entries(input.kind, input.todo_entries)?;
+        validate_item_content(&input.title, &input.content, !todo_entries.is_empty())?;
+        let title = normalize_title(&input.title);
+        let tags = normalize_tags(input.tags);
+        let tags_json = serde_json::to_string(&tags)
+            .map_err(|error| format!("serialize tags failed: {error}"))?;
+        let now = now_ms();
+        let id = uuid::Uuid::new_v4().to_string();
+        let (ciphertext, nonce) = self.encrypt_content(&id, &input.content)?;
+
+        let item = {
+            let mut connection = self.lock()?;
+            let transaction = connection
+                .transaction()
+                .map_err(|error| format!("start MCP item creation failed: {error}"))?;
+            Self::assert_mcp_group_write(&transaction, client_id, &group)?;
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO items (
+                        id, kind, group_key, title, content_ciphertext, content_nonce,
+                        content_version, status, sensitivity, color, tags_json, due_at,
+                        expires_at, completed_at, mcp_access, revision, created_at,
+                        updated_at, archived_at
+                    ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6,
+                        1, 'active', 'standard', 'sun', ?7, ?8,
+                        NULL, NULL, 'read_write', 1, ?9,
+                        ?9, NULL
+                    )
+                    "#,
+                    params![
+                        id,
+                        input.kind.as_str(),
+                        group,
+                        title,
+                        ciphertext,
+                        nonce,
+                        tags_json,
+                        input.due_at,
+                        now,
+                    ],
+                )
+                .map_err(|error| format!("insert MCP item failed: {error}"))?;
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO item_windows (
+                        item_id, width, height, scale_factor, always_on_top,
+                        opacity, is_visible, updated_at
+                    ) VALUES (?1, 340, 360, 1, 1, 1, 0, ?2)
+                    "#,
+                    params![id, now],
+                )
+                .map_err(|error| format!("insert window state failed: {error}"))?;
+
+            for (position, text) in todo_entries.iter().enumerate() {
+                let entry_id = uuid::Uuid::new_v4().to_string();
+                let (ciphertext, nonce) = self.encrypt_todo_entry(&id, &entry_id, text)?;
+                transaction
+                    .execute(
+                        r#"
+                        INSERT INTO todo_entries (
+                            id, item_id, text_ciphertext, text_nonce, text_version,
+                            is_completed, position, revision, created_at, updated_at, completed_at
+                        ) VALUES (?1, ?2, ?3, ?4, 1, 0, ?5, 1, ?6, ?6, NULL)
+                        "#,
+                        params![entry_id, id, ciphertext, nonce, position as i64, now],
+                    )
+                    .map_err(|error| format!("insert MCP TODO entry failed: {error}"))?;
+            }
+            Self::record_mcp_event(&transaction, &id, &group, client_id, "item.created", 1, now)?;
+            let item = self.get_mcp_item_with_connection(&transaction, client_id, &id)?;
+            transaction
+                .commit()
+                .map_err(|error| format!("commit MCP item creation failed: {error}"))?;
+            item
+        };
+
+        Ok(item)
+    }
+
+    pub fn mcp_update_item(
+        &self,
+        client_id: &str,
+        input: McpUpdateItemInput,
+    ) -> Result<McpItemView, String> {
+        validate_optional_timestamp_ms("dueAt", input.due_at)?;
+        let todo_entries = input
+            .todo_entries
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry: McpTodoEntryDraftInput| TodoEntryDraftInput {
+                        id: entry.id,
+                        expected_revision: entry.expected_revision,
+                        text: entry.text,
+                        is_completed: entry.is_completed,
+                    })
+                    .collect()
+            })
+            .map(normalize_todo_drafts)
+            .transpose()?;
+        validate_item_content(
+            &input.title,
+            &input.content,
+            todo_entries
+                .as_ref()
+                .is_some_and(|entries| !entries.is_empty()),
+        )?;
+        let title = normalize_title(&input.title);
+        let tags_json = serde_json::to_string(&normalize_tags(input.tags))
+            .map_err(|error| format!("serialize tags failed: {error}"))?;
+        let (ciphertext, nonce) = self.encrypt_content(&input.id, &input.content)?;
+        let now = now_ms();
+        let new_revision = input.expected_revision + 1;
+
+        let item = {
+            let mut connection = self.lock()?;
+            let transaction = connection
+                .transaction()
+                .map_err(|error| format!("start MCP item update failed: {error}"))?;
+            let authorized = Self::find_mcp_writable_item(
+                &transaction,
+                client_id,
+                &input.id,
+                input.expected_revision,
+                true,
+            )?;
+            let (kind, group) = authorized.ok_or_else(|| {
+                "item is unavailable, read-only, or changed elsewhere; reload before saving"
+                    .to_string()
+            })?;
+            let changed = transaction
+                .execute(
+                    r#"
+                    UPDATE items
+                    SET title = ?1,
+                        content_ciphertext = ?2,
+                        content_nonce = ?3,
+                        tags_json = ?4,
+                        due_at = ?5,
+                        revision = revision + 1,
+                        updated_at = ?6
+                    WHERE id = ?7 AND revision = ?8 AND status <> 'archived'
+                    "#,
+                    params![
+                        title,
+                        ciphertext,
+                        nonce,
+                        tags_json,
+                        input.due_at,
+                        now,
+                        input.id,
+                        input.expected_revision,
+                    ],
+                )
+                .map_err(|error| format!("update MCP item failed: {error}"))?;
+            if changed == 0 {
+                return Err("item changed elsewhere; reload before saving".to_string());
+            }
+            if let Some(entries) = todo_entries.as_ref() {
+                if kind != ItemKind::Todo {
+                    return Err("checklist entries are only valid for TODO items".to_string());
+                }
+                self.reconcile_todo_entries(&transaction, &input.id, entries, now)?;
+                Self::sync_todo_parent_status(&transaction, &input.id, now, None, false)?;
+            }
+            Self::record_mcp_event(
+                &transaction,
+                &input.id,
+                &group,
+                client_id,
+                "item.updated",
+                new_revision,
+                now,
+            )?;
+            let item = self.get_mcp_item_with_connection(&transaction, client_id, &input.id)?;
+            transaction
+                .commit()
+                .map_err(|error| format!("commit MCP item update failed: {error}"))?;
+            item
+        };
+        Ok(item)
+    }
+
+    pub fn mcp_move_item(
+        &self,
+        client_id: &str,
+        input: McpMoveItemInput,
+    ) -> Result<McpItemView, String> {
+        let target_group = normalize_group(Some(&input.target_group))?;
+        let now = now_ms();
+        let new_revision = input.expected_revision + 1;
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("start MCP item move failed: {error}"))?;
+        let (_, source_group) = Self::find_mcp_writable_item(
+            &transaction,
+            client_id,
+            &input.id,
+            input.expected_revision,
+            false,
+        )?
+        .ok_or_else(|| {
+            "item is unavailable, read-only, or changed elsewhere; reload before moving".to_string()
+        })?;
+        if source_group == target_group {
+            return Err("item already belongs to the target group".to_string());
+        }
+        Self::assert_group_exists(&transaction, &target_group)?;
+        Self::assert_mcp_group_write(&transaction, client_id, &target_group)?;
+
+        let changed = transaction
+            .execute(
+                r#"
+                UPDATE items
+                SET group_key = ?1,
+                    revision = revision + 1,
+                    updated_at = ?2
+                WHERE id = ?3 AND revision = ?4
+                "#,
+                params![target_group, now, input.id, input.expected_revision],
+            )
+            .map_err(|error| format!("move MCP item failed: {error}"))?;
+        if changed == 0 {
+            return Err("item changed elsewhere; reload before moving".to_string());
+        }
+
+        let payload_json = serde_json::to_string(&serde_json::json!({
+            "fromGroup": &source_group,
+            "toGroup": &target_group,
+        }))
+        .map_err(|error| format!("serialize MCP item move event failed: {error}"))?;
+        Self::record_mcp_event_with_payload(
+            &transaction,
+            &input.id,
+            &target_group,
+            client_id,
+            "item.moved",
+            new_revision,
+            &payload_json,
+            now,
+        )?;
+        let item = self.get_mcp_item_with_connection(&transaction, client_id, &input.id)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit MCP item move failed: {error}"))?;
+        Ok(item)
+    }
+
+    pub fn mcp_set_status(
+        &self,
+        client_id: &str,
+        input: McpSetStatusInput,
+    ) -> Result<McpItemView, String> {
+        let now = now_ms();
+        let completed_at = (input.status == ItemStatus::Completed).then_some(now);
+        let archived_at = (input.status == ItemStatus::Archived).then_some(now);
+        let new_revision = input.expected_revision + 1;
+        let item = {
+            let mut connection = self.lock()?;
+            let transaction = connection
+                .transaction()
+                .map_err(|error| format!("start MCP status update failed: {error}"))?;
+            let (kind, group) = Self::find_mcp_writable_item(
+                &transaction,
+                client_id,
+                &input.id,
+                input.expected_revision,
+                false,
+            )?
+            .ok_or_else(|| {
+                "item is unavailable, read-only, or changed elsewhere; reload before changing status"
+                    .to_string()
+            })?;
+
+            if kind == ItemKind::Todo
+                && matches!(input.status, ItemStatus::Active | ItemStatus::Completed)
+            {
+                let is_completed = input.status == ItemStatus::Completed;
+                transaction
+                    .execute(
+                        r#"
+                        UPDATE todo_entries
+                        SET is_completed = ?1,
+                            completed_at = CASE WHEN ?1 = 1 THEN ?2 ELSE NULL END,
+                            revision = revision + 1,
+                            updated_at = ?2
+                        WHERE item_id = ?3 AND is_completed <> ?1
+                        "#,
+                        params![bool_to_int(is_completed), now, input.id],
+                    )
+                    .map_err(|error| format!("sync MCP TODO entries failed: {error}"))?;
+            }
+            let changed = transaction
+                .execute(
+                    r#"
+                    UPDATE items
+                    SET status = ?1,
+                        completed_at = ?2,
+                        archived_at = ?3,
+                        revision = revision + 1,
+                        updated_at = ?4
+                    WHERE id = ?5 AND revision = ?6
+                    "#,
+                    params![
+                        input.status.as_str(),
+                        completed_at,
+                        archived_at,
+                        now,
+                        input.id,
+                        input.expected_revision,
+                    ],
+                )
+                .map_err(|error| format!("update MCP item status failed: {error}"))?;
+            if changed == 0 {
+                return Err("item changed elsewhere; reload before changing status".to_string());
+            }
+            Self::record_mcp_event(
+                &transaction,
+                &input.id,
+                &group,
+                client_id,
+                "item.status_changed",
+                new_revision,
+                now,
+            )?;
+            let item = self.get_mcp_item_with_connection(&transaction, client_id, &input.id)?;
+            transaction
+                .commit()
+                .map_err(|error| format!("commit MCP status update failed: {error}"))?;
+            item
+        };
+        Ok(item)
+    }
+
+    pub fn mcp_set_todo_entry_completed(
+        &self,
+        client_id: &str,
+        input: McpSetTodoEntryCompletedInput,
+    ) -> Result<McpItemView, String> {
+        let now = now_ms();
+        let new_revision = input.expected_item_revision + 1;
+        let item = {
+            let mut connection = self.lock()?;
+            let transaction = connection
+                .transaction()
+                .map_err(|error| format!("start MCP TODO status update failed: {error}"))?;
+            let (kind, group) = Self::find_mcp_writable_item(
+                &transaction,
+                client_id,
+                &input.item_id,
+                input.expected_item_revision,
+                true,
+            )?
+            .ok_or_else(|| {
+                "TODO item is unavailable, read-only, or changed elsewhere".to_string()
+            })?;
+            if kind != ItemKind::Todo {
+                return Err("checklist entries are only valid for TODO items".to_string());
+            }
+            let changed = transaction
+                .execute(
+                    r#"
+                    UPDATE todo_entries
+                    SET is_completed = ?1,
+                        completed_at = CASE WHEN ?1 = 1 THEN ?2 ELSE NULL END,
+                        revision = revision + 1,
+                        updated_at = ?2
+                    WHERE id = ?3 AND item_id = ?4 AND revision = ?5
+                    "#,
+                    params![
+                        bool_to_int(input.is_completed),
+                        now,
+                        input.entry_id,
+                        input.item_id,
+                        input.expected_entry_revision,
+                    ],
+                )
+                .map_err(|error| format!("update MCP TODO entry status failed: {error}"))?;
+            if changed == 0 {
+                return Err("TODO entry changed elsewhere; reload before updating".to_string());
+            }
+            Self::sync_todo_parent_status(
+                &transaction,
+                &input.item_id,
+                now,
+                Some(input.expected_item_revision),
+                true,
+            )?;
+            Self::record_mcp_event(
+                &transaction,
+                &input.item_id,
+                &group,
+                client_id,
+                "todo_entry.completed_changed",
+                new_revision,
+                now,
+            )?;
+            let item =
+                self.get_mcp_item_with_connection(&transaction, client_id, &input.item_id)?;
+            transaction
+                .commit()
+                .map_err(|error| format!("commit MCP TODO status update failed: {error}"))?;
+            item
+        };
+        Ok(item)
     }
 
     pub fn list_items(&self, include_archived: bool) -> Result<Vec<Item>, String> {
@@ -263,6 +1280,8 @@ impl Store {
     }
 
     pub fn create_item(&self, input: CreateItemInput) -> Result<Item, String> {
+        validate_optional_timestamp_ms("dueAt", input.due_at)?;
+        validate_optional_timestamp_ms("expiresAt", input.expires_at)?;
         let todo_entries = normalize_initial_todo_entries(input.kind, input.todo_entries)?;
         validate_item_content(&input.title, &input.content, !todo_entries.is_empty())?;
         let now = now_ms();
@@ -295,6 +1314,7 @@ impl Store {
             let transaction = connection
                 .transaction()
                 .map_err(|error| format!("start item transaction failed: {error}"))?;
+            Self::ensure_group(&transaction, &group, now)?;
             transaction
                 .execute(
                     r#"
@@ -361,6 +1381,8 @@ impl Store {
     }
 
     pub fn update_item(&self, input: UpdateItemInput) -> Result<Item, String> {
+        validate_optional_timestamp_ms("dueAt", input.due_at)?;
+        validate_optional_timestamp_ms("expiresAt", input.expires_at)?;
         let todo_entries = input.todo_entries.map(normalize_todo_drafts).transpose()?;
         validate_item_content(
             &input.title,
@@ -382,6 +1404,7 @@ impl Store {
             let transaction = connection
                 .transaction()
                 .map_err(|error| format!("start item update failed: {error}"))?;
+            Self::ensure_group(&transaction, &group, now)?;
             let changed = transaction
                 .execute(
                     r#"
@@ -744,6 +1767,42 @@ impl Store {
         Ok(theme)
     }
 
+    pub fn get_locale(&self) -> Result<LocalePreference, String> {
+        let value = self
+            .lock()?
+            .query_row(
+                "SELECT value_json FROM settings WHERE key = ?1",
+                [LOCALE_SETTING_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("read locale setting failed: {error}"))?;
+
+        match value {
+            Some(value) => serde_json::from_str(&value)
+                .map_err(|error| format!("decode locale setting failed: {error}")),
+            None => Ok(LocalePreference::System),
+        }
+    }
+
+    pub fn set_locale(&self, locale: LocalePreference) -> Result<LocalePreference, String> {
+        let value = serde_json::to_string(&locale)
+            .map_err(|error| format!("encode locale setting failed: {error}"))?;
+        self.lock()?
+            .execute(
+                r#"
+                INSERT INTO settings (key, value_json, updated_at)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                "#,
+                params![LOCALE_SETTING_KEY, value, now_ms()],
+            )
+            .map_err(|error| format!("save locale setting failed: {error}"))?;
+        Ok(locale)
+    }
+
     pub fn set_window_opacity(&self, input: WindowOpacityInput) -> Result<WindowState, String> {
         if !input.background_opacity.is_finite() || !input.text_opacity.is_finite() {
             return Err("window opacity must be a finite number".to_string());
@@ -840,6 +1899,482 @@ impl Store {
             .optional()
             .map_err(|error| format!("query window state failed: {error}"))?
             .ok_or_else(|| "window state not found".to_string())
+    }
+
+    fn get_mcp_item_with_connection(
+        &self,
+        connection: &Connection,
+        client_id: &str,
+        item_id: &str,
+    ) -> Result<McpItemView, String> {
+        let sql = format!(
+            r#"
+            {MCP_ITEM_SELECT}
+            WHERE i.id = ?1
+              AND i.kind IN ('note', 'todo')
+              AND i.sensitivity = 'standard'
+              AND i.mcp_access <> 'deny'
+              AND EXISTS (
+                  SELECT 1
+                  FROM mcp_group_grants g
+                  JOIN mcp_clients c ON c.id = g.client_id
+                  WHERE g.client_id = ?2
+                    AND g.group_key = i.group_key
+                    AND g.revoked_at IS NULL
+                    AND c.revoked_at IS NULL
+              )
+            "#
+        );
+        let stored = connection
+            .query_row(
+                &sql,
+                params![item_id, client_id],
+                Self::read_stored_mcp_item,
+            )
+            .optional()
+            .map_err(|error| format!("query MCP item failed: {error}"))?
+            .ok_or_else(|| "MCP item not found or access denied".to_string())?;
+        self.decrypt_mcp_item(connection, stored)
+    }
+
+    fn decrypt_mcp_item(
+        &self,
+        connection: &Connection,
+        stored: StoredMcpItem,
+    ) -> Result<McpItemView, String> {
+        let key = Key::from(self.key);
+        let cipher = XChaCha20Poly1305::new(&key);
+        let nonce = XNonce::try_from(stored.nonce.as_slice())
+            .map_err(|_| "invalid item nonce".to_string())?;
+        let plaintext = cipher
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: stored.ciphertext.as_slice(),
+                    aad: stored.id.as_bytes(),
+                },
+            )
+            .map_err(|_| "decrypt item content failed".to_string())?;
+        let content =
+            String::from_utf8(plaintext).map_err(|_| "item content is not UTF-8".to_string())?;
+        let tags = serde_json::from_str(&stored.tags_json)
+            .map_err(|error| format!("parse tags failed: {error}"))?;
+        let todo_entries = self.read_mcp_todo_entries(connection, &stored.id)?;
+        Ok(McpItemView {
+            id: stored.id,
+            kind: ItemKind::from_db(&stored.kind)?,
+            group: stored.group_key,
+            title: stored.title,
+            content,
+            status: ItemStatus::from_db(&stored.status)?,
+            tags,
+            due_at: stored.due_at,
+            completed_at: stored.completed_at,
+            revision: stored.revision,
+            created_at: stored.created_at,
+            updated_at: stored.updated_at,
+            archived_at: stored.archived_at,
+            todo_entries,
+        })
+    }
+
+    fn read_mcp_todo_entries(
+        &self,
+        connection: &Connection,
+        item_id: &str,
+    ) -> Result<Vec<McpTodoEntryView>, String> {
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT id, text_ciphertext, text_nonce, is_completed,
+                       position, revision, created_at, updated_at, completed_at
+                FROM todo_entries
+                WHERE item_id = ?1
+                ORDER BY position, created_at, id
+                "#,
+            )
+            .map_err(|error| format!("prepare MCP TODO entries failed: {error}"))?;
+        let rows = statement
+            .query_map([item_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                ))
+            })
+            .map_err(|error| format!("query MCP TODO entries failed: {error}"))?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (
+                id,
+                ciphertext,
+                nonce,
+                is_completed,
+                position,
+                revision,
+                created_at,
+                updated_at,
+                completed_at,
+            ) = row.map_err(|error| format!("read MCP TODO entry failed: {error}"))?;
+            let text = self.decrypt_todo_entry(item_id, &id, &ciphertext, &nonce)?;
+            entries.push(McpTodoEntryView {
+                id,
+                text,
+                is_completed,
+                position,
+                revision,
+                created_at,
+                updated_at,
+                completed_at,
+            });
+        }
+        Ok(entries)
+    }
+
+    fn ensure_group(transaction: &Transaction<'_>, group: &str, now: i64) -> Result<(), String> {
+        transaction
+            .execute(
+                r#"
+                INSERT OR IGNORE INTO item_groups (group_key, created_at, updated_at)
+                VALUES (?1, ?2, ?2)
+                "#,
+                params![group, now],
+            )
+            .map_err(|error| format!("ensure group exists failed: {error}"))?;
+        Ok(())
+    }
+
+    fn insert_group(transaction: &Transaction<'_>, group: &str, now: i64) -> Result<(), String> {
+        let changed = transaction
+            .execute(
+                r#"
+                INSERT OR IGNORE INTO item_groups (group_key, created_at, updated_at)
+                VALUES (?1, ?2, ?2)
+                "#,
+                params![group, now],
+            )
+            .map_err(|error| format!("create group failed: {error}"))?;
+        if changed == 0 {
+            return Err("group already exists".to_string());
+        }
+        Ok(())
+    }
+
+    fn assert_group_exists(transaction: &Transaction<'_>, group: &str) -> Result<(), String> {
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM item_groups WHERE group_key = ?1)",
+                [group],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("check group existence failed: {error}"))?;
+        if !exists {
+            return Err("target group does not exist; create it first".to_string());
+        }
+        Ok(())
+    }
+
+    fn get_group_with_connection(
+        connection: &Connection,
+        group: &str,
+    ) -> Result<ItemGroup, String> {
+        connection
+            .query_row(
+                r#"
+                SELECT
+                    g.group_key,
+                    COUNT(i.id),
+                    COALESCE(SUM(CASE WHEN i.status <> 'archived' THEN 1 ELSE 0 END), 0),
+                    g.created_at,
+                    g.updated_at
+                FROM item_groups g
+                LEFT JOIN items i ON i.group_key = g.group_key
+                WHERE g.group_key = ?1
+                GROUP BY g.group_key, g.created_at, g.updated_at
+                "#,
+                [group],
+                |row| {
+                    Ok(ItemGroup {
+                        key: row.get(0)?,
+                        item_count: row.get(1)?,
+                        visible_item_count: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("read group failed: {error}"))?
+            .ok_or_else(|| "group not found".to_string())
+    }
+
+    fn rename_group_in_transaction(
+        transaction: &Transaction<'_>,
+        group: &str,
+        new_group: &str,
+        now: i64,
+    ) -> Result<(), String> {
+        if group == "inbox" {
+            return Err("the inbox group cannot be renamed".to_string());
+        }
+        if group == new_group {
+            return Err("the new group name must be different".to_string());
+        }
+
+        let source_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM item_groups WHERE group_key = ?1)",
+                [group],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("validate source group failed: {error}"))?;
+        if !source_exists {
+            return Err("group not found".to_string());
+        }
+        let target_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM item_groups WHERE group_key = ?1)",
+                [new_group],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("validate target group failed: {error}"))?;
+        if target_exists {
+            return Err("the target group already exists".to_string());
+        }
+
+        transaction
+            .execute(
+                "UPDATE item_groups SET group_key = ?1, updated_at = ?2 WHERE group_key = ?3",
+                params![new_group, now, group],
+            )
+            .map_err(|error| format!("rename group failed: {error}"))?;
+        transaction
+            .execute(
+                r#"
+                UPDATE items
+                SET group_key = ?1,
+                    revision = revision + 1,
+                    updated_at = ?2
+                WHERE group_key = ?3
+                "#,
+                params![new_group, now, group],
+            )
+            .map_err(|error| format!("move items into renamed group failed: {error}"))?;
+        transaction
+            .execute(
+                "UPDATE mcp_group_grants SET group_key = ?1 WHERE group_key = ?2",
+                params![new_group, group],
+            )
+            .map_err(|error| format!("move MCP grants into renamed group failed: {error}"))?;
+        transaction
+            .execute(
+                "UPDATE task_events SET group_key = ?1 WHERE group_key = ?2",
+                params![new_group, group],
+            )
+            .map_err(|error| format!("move task events into renamed group failed: {error}"))?;
+        Ok(())
+    }
+
+    fn assert_mcp_group_management(
+        transaction: &Transaction<'_>,
+        client_id: &str,
+    ) -> Result<(), String> {
+        let scopes_json = transaction
+            .query_row(
+                "SELECT scopes_json FROM mcp_clients WHERE id = ?1 AND revoked_at IS NULL",
+                [client_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("check MCP group-management capability failed: {error}"))?
+            .ok_or_else(|| "active MCP client not found".to_string())?;
+        if !mcp_scope_enabled(&scopes_json, MCP_GROUP_MANAGEMENT_SCOPE)? {
+            return Err(
+                "MCP client is not explicitly authorized to manage groups; enable it in the main window"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_mcp_group_coordinator(
+        transaction: &Transaction<'_>,
+        client_id: &str,
+        group: &str,
+    ) -> Result<(), String> {
+        let allowed: bool = transaction
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM mcp_group_grants g
+                    JOIN mcp_clients c ON c.id = g.client_id
+                    WHERE g.client_id = ?1
+                      AND g.group_key = ?2
+                      AND g.role = 'coordinator'
+                      AND g.revoked_at IS NULL
+                      AND c.revoked_at IS NULL
+                )
+                "#,
+                params![client_id, group],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("check MCP group coordinator access failed: {error}"))?;
+        if !allowed {
+            return Err("MCP client is not a coordinator for this group".to_string());
+        }
+        Ok(())
+    }
+
+    fn assert_mcp_group_write(
+        transaction: &Transaction<'_>,
+        client_id: &str,
+        group: &str,
+    ) -> Result<(), String> {
+        let allowed: bool = transaction
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM mcp_group_grants g
+                    JOIN mcp_clients c ON c.id = g.client_id
+                    WHERE g.client_id = ?1
+                      AND g.group_key = ?2
+                      AND g.role IN ('contributor', 'coordinator')
+                      AND g.revoked_at IS NULL
+                      AND c.revoked_at IS NULL
+                )
+                "#,
+                params![client_id, group],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("check MCP group access failed: {error}"))?;
+        if !allowed {
+            return Err("MCP client does not have write access to this group".to_string());
+        }
+        Ok(())
+    }
+
+    fn find_mcp_writable_item(
+        transaction: &Transaction<'_>,
+        client_id: &str,
+        item_id: &str,
+        expected_revision: i64,
+        require_unarchived: bool,
+    ) -> Result<Option<(ItemKind, String)>, String> {
+        transaction
+            .query_row(
+                r#"
+                SELECT i.kind, i.group_key
+                FROM items i
+                WHERE i.id = ?1
+                  AND i.revision = ?2
+                  AND (?3 = 0 OR i.status <> 'archived')
+                  AND i.kind IN ('note', 'todo')
+                  AND i.sensitivity = 'standard'
+                  AND i.mcp_access IN ('inherit', 'read_write')
+                  AND EXISTS (
+                      SELECT 1
+                      FROM mcp_group_grants g
+                      JOIN mcp_clients c ON c.id = g.client_id
+                      WHERE g.client_id = ?4
+                        AND g.group_key = i.group_key
+                        AND g.role IN ('contributor', 'coordinator')
+                        AND g.revoked_at IS NULL
+                        AND c.revoked_at IS NULL
+                  )
+                "#,
+                params![
+                    item_id,
+                    expected_revision,
+                    bool_to_int(require_unarchived),
+                    client_id,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("authorize MCP item mutation failed: {error}"))?
+            .map(|(kind, group)| Ok((ItemKind::from_db(&kind)?, group)))
+            .transpose()
+    }
+
+    fn record_mcp_event(
+        transaction: &Transaction<'_>,
+        item_id: &str,
+        group: &str,
+        client_id: &str,
+        action: &str,
+        item_revision: i64,
+        now: i64,
+    ) -> Result<(), String> {
+        Self::record_mcp_event_with_payload(
+            transaction,
+            item_id,
+            group,
+            client_id,
+            action,
+            item_revision,
+            "{}",
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_mcp_event_with_payload(
+        transaction: &Transaction<'_>,
+        item_id: &str,
+        group: &str,
+        client_id: &str,
+        action: &str,
+        item_revision: i64,
+        payload_json: &str,
+        now: i64,
+    ) -> Result<(), String> {
+        transaction
+            .execute(
+                r#"
+                INSERT INTO task_events (
+                    item_id, group_key, actor_client_id, action,
+                    item_revision, payload_json, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    item_id,
+                    group,
+                    client_id,
+                    action,
+                    item_revision,
+                    payload_json,
+                    now,
+                ],
+            )
+            .map_err(|error| format!("record MCP item event failed: {error}"))?;
+        Ok(())
+    }
+
+    fn read_stored_mcp_item(row: &Row<'_>) -> rusqlite::Result<StoredMcpItem> {
+        Ok(StoredMcpItem {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            group_key: row.get(2)?,
+            title: row.get(3)?,
+            ciphertext: row.get(4)?,
+            nonce: row.get(5)?,
+            status: row.get(6)?,
+            tags_json: row.get(7)?,
+            due_at: row.get(8)?,
+            completed_at: row.get(9)?,
+            revision: row.get(10)?,
+            created_at: row.get(11)?,
+            updated_at: row.get(12)?,
+            archived_at: row.get(13)?,
+        })
     }
 
     fn read_todo_entries(
@@ -1311,6 +2846,15 @@ fn validate_item_content(title: &str, content: &str, has_todo_entries: bool) -> 
     Ok(())
 }
 
+fn validate_optional_timestamp_ms(label: &str, value: Option<i64>) -> Result<(), String> {
+    if value.is_some_and(|timestamp| !(0..=MAX_TIMESTAMP_MS).contains(&timestamp)) {
+        return Err(format!(
+            "{label} must be a Unix timestamp in milliseconds between 0 and {MAX_TIMESTAMP_MS}"
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_initial_todo_entries(
     kind: ItemKind,
     entries: Vec<String>,
@@ -1410,6 +2954,42 @@ fn bool_to_int(value: bool) -> i64 {
     if value { 1 } else { 0 }
 }
 
+fn hash_mcp_token(token: &str) -> Vec<u8> {
+    Sha256::digest(token.as_bytes()).to_vec()
+}
+
+fn parse_mcp_scopes(value: &str) -> Result<Vec<String>, String> {
+    serde_json::from_str(value)
+        .map_err(|error| format!("decode MCP client capabilities failed: {error}"))
+}
+
+fn mcp_scope_enabled(value: &str, scope: &str) -> Result<bool, String> {
+    Ok(parse_mcp_scopes(value)?
+        .iter()
+        .any(|candidate| candidate == scope))
+}
+
+fn parse_mcp_client_id(token: &str) -> Option<String> {
+    let (client_id, secret) = token.strip_prefix("tips_")?.split_once('_')?;
+    if secret.len() != 64 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let parsed = uuid::Uuid::parse_str(client_id).ok()?;
+    (parsed.to_string() == client_id).then(|| client_id.to_string())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1438,6 +3018,37 @@ mod tests {
             mcp_access: None,
             todo_entries: vec![],
         }
+    }
+
+    #[test]
+    fn persisted_timestamps_stay_within_the_supported_date_range() {
+        assert!(validate_optional_timestamp_ms("dueAt", None).is_ok());
+        assert!(validate_optional_timestamp_ms("dueAt", Some(0)).is_ok());
+        assert!(validate_optional_timestamp_ms("dueAt", Some(MAX_TIMESTAMP_MS)).is_ok());
+        assert!(validate_optional_timestamp_ms("dueAt", Some(-1)).is_err());
+        assert!(validate_optional_timestamp_ms("dueAt", Some(MAX_TIMESTAMP_MS + 1)).is_err());
+    }
+
+    fn mcp_client_with_role(
+        store: &Store,
+        display_name: &str,
+        group: &str,
+        role: McpGroupRole,
+    ) -> CreatedMcpClient {
+        let created = store
+            .create_mcp_client(CreateMcpClientInput {
+                display_name: display_name.to_string(),
+                transport: McpTransport::LoopbackHttp,
+            })
+            .unwrap();
+        store
+            .set_mcp_group_grant(SetMcpGroupGrantInput {
+                client_id: created.client.id.clone(),
+                group: group.to_string(),
+                role,
+            })
+            .unwrap();
+        created
     }
 
     #[test]
@@ -1511,7 +3122,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_migrates_window_opacity() {
+    fn v1_database_migrates_through_persistent_groups() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(INITIAL_MIGRATION).unwrap();
         connection
@@ -1541,6 +3152,7 @@ mod tests {
             .unwrap();
 
         let store = Store::from_connection(connection, [7_u8; 32]).unwrap();
+        let mcp_config = store.get_mcp_server_config().unwrap();
         let connection = store.connection.lock().unwrap();
         let (version, background, text, group): (i64, f64, f64, String) = connection
             .query_row(
@@ -1549,10 +3161,723 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 6);
         assert_eq!(background, 0.55);
         assert_eq!(text, 1.0);
         assert_eq!(group, "inbox");
+        assert!(mcp_config.enabled);
+        assert_eq!(mcp_config.bind_address, "127.0.0.1");
+        assert!(!mcp_config.allow_lan);
+        drop(connection);
+        assert_eq!(store.list_groups().unwrap()[0].key, "inbox");
+    }
+
+    #[test]
+    fn groups_persist_when_empty_and_rename_items_and_grants_atomically() {
+        let store = store();
+        let created_group = store
+            .create_group(CreateGroupInput {
+                group: "Project/Alpha".to_string(),
+            })
+            .unwrap();
+        assert_eq!(created_group.key, "project/alpha");
+        assert_eq!(created_group.item_count, 0);
+
+        let mut input = note_input("grouped item");
+        input.group = Some(created_group.key.clone());
+        let item = store.create_item(input).unwrap();
+        let client = mcp_client_with_role(
+            &store,
+            "Coordinator",
+            &created_group.key,
+            McpGroupRole::Coordinator,
+        );
+
+        let renamed = store
+            .rename_group(RenameGroupInput {
+                group: created_group.key,
+                new_group: "Project/Beta".to_string(),
+            })
+            .unwrap();
+        assert_eq!(renamed.key, "project/beta");
+        assert_eq!(renamed.item_count, 1);
+        let moved_item = store.get_item(&item.id).unwrap();
+        assert_eq!(moved_item.group, "project/beta");
+        assert_eq!(moved_item.revision, item.revision + 1);
+        assert_eq!(
+            store.mcp_list_groups(&client.client.id).unwrap(),
+            vec!["project/beta".to_string()]
+        );
+        assert!(
+            store
+                .rename_group(RenameGroupInput {
+                    group: "inbox".to_string(),
+                    new_group: "renamed-inbox".to_string(),
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_group_management_requires_explicit_client_capability() {
+        let store = store();
+        let viewer = mcp_client_with_role(&store, "Viewer", "read-only", McpGroupRole::Viewer);
+        assert!(
+            store
+                .mcp_create_group(
+                    &viewer.client.id,
+                    McpCreateGroupInput {
+                        group: "denied".to_string(),
+                    },
+                )
+                .is_err()
+        );
+
+        let coordinator =
+            mcp_client_with_role(&store, "Coordinator", "managed", McpGroupRole::Coordinator);
+        assert!(!coordinator.client.can_manage_groups);
+        assert!(
+            store
+                .mcp_create_group(
+                    &coordinator.client.id,
+                    McpCreateGroupInput {
+                        group: "still-denied".to_string(),
+                    },
+                )
+                .is_err()
+        );
+        store
+            .set_mcp_group_management(&coordinator.client.id, true)
+            .unwrap();
+        assert!(
+            store
+                .list_mcp_clients(false)
+                .unwrap()
+                .into_iter()
+                .find(|client| client.id == coordinator.client.id)
+                .unwrap()
+                .can_manage_groups
+        );
+        let created = store
+            .mcp_create_group(
+                &coordinator.client.id,
+                McpCreateGroupInput {
+                    group: "Managed/New".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(created.key, "managed/new");
+        let renamed = store
+            .mcp_rename_group(
+                &coordinator.client.id,
+                McpRenameGroupInput {
+                    group: created.key,
+                    new_group: "Managed/Renamed".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(renamed.key, "managed/renamed");
+
+        store
+            .set_mcp_group_management(&coordinator.client.id, false)
+            .unwrap();
+        assert!(
+            store
+                .mcp_rename_group(
+                    &coordinator.client.id,
+                    McpRenameGroupInput {
+                        group: "managed/renamed".to_string(),
+                        new_group: "not-allowed".to_string(),
+                    },
+                )
+                .is_err()
+        );
+
+        store
+            .set_mcp_group_management(&viewer.client.id, true)
+            .unwrap();
+        let viewer_created = store
+            .mcp_create_group(
+                &viewer.client.id,
+                McpCreateGroupInput {
+                    group: "explicitly-allowed".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(viewer_created.key, "explicitly-allowed");
+        assert_eq!(
+            store
+                .list_mcp_group_grants(Some(&viewer.client.id), false)
+                .unwrap()
+                .into_iter()
+                .find(|grant| grant.group == "explicitly-allowed")
+                .unwrap()
+                .role,
+            McpGroupRole::Coordinator
+        );
+    }
+
+    #[test]
+    fn mcp_item_move_requires_write_access_to_source_and_target() {
+        let store = store();
+        let writer = mcp_client_with_role(&store, "Writer", "source", McpGroupRole::Contributor);
+        let created = store
+            .mcp_create_item(
+                &writer.client.id,
+                McpCreateItemInput {
+                    group: "source".to_string(),
+                    kind: ItemKind::Note,
+                    title: "Move me".to_string(),
+                    content: "Shared plan".to_string(),
+                    tags: vec![],
+                    due_at: None,
+                    todo_entries: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .create_group(CreateGroupInput {
+                group: "target".to_string(),
+            })
+            .unwrap();
+
+        assert!(
+            store
+                .mcp_move_item(
+                    &writer.client.id,
+                    McpMoveItemInput {
+                        id: created.id.clone(),
+                        expected_revision: created.revision,
+                        target_group: "target".to_string(),
+                    },
+                )
+                .is_err()
+        );
+        store
+            .set_mcp_group_grant(SetMcpGroupGrantInput {
+                client_id: writer.client.id.clone(),
+                group: "target".to_string(),
+                role: McpGroupRole::Contributor,
+            })
+            .unwrap();
+        let moved = store
+            .mcp_move_item(
+                &writer.client.id,
+                McpMoveItemInput {
+                    id: created.id.clone(),
+                    expected_revision: created.revision,
+                    target_group: "target".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(moved.group, "target");
+        assert_eq!(moved.revision, created.revision + 1);
+
+        let (event_group, payload): (String, String) = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT group_key, payload_json FROM task_events WHERE item_id = ?1 AND action = 'item.moved'",
+                [&created.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(event_group, "target");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payload).unwrap(),
+            serde_json::json!({"fromGroup": "source", "toGroup": "target"})
+        );
+    }
+
+    #[test]
+    fn mcp_tokens_are_hashed_transport_bound_and_revocable() {
+        let store = store();
+        let created = store
+            .create_mcp_client(CreateMcpClientInput {
+                display_name: "Local agent".to_string(),
+                transport: McpTransport::LoopbackHttp,
+            })
+            .unwrap();
+
+        let stored_hash: Vec<u8> = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT token_hash FROM mcp_clients WHERE id = ?1",
+                [&created.client.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_hash.len(), 32);
+        assert_ne!(stored_hash, created.bearer_token.as_bytes());
+
+        let principal = store
+            .authenticate_mcp_client(&created.bearer_token, McpTransport::LoopbackHttp)
+            .unwrap();
+        assert_eq!(principal.client_id, created.client.id);
+        assert_eq!(principal.display_name, "Local agent");
+        assert_eq!(principal.transport, McpTransport::LoopbackHttp);
+        assert!(
+            store
+                .authenticate_mcp_client(&created.bearer_token, McpTransport::Stdio)
+                .is_err()
+        );
+
+        let mut invalid = created.bearer_token.clone();
+        let replacement = if invalid.ends_with('0') { '1' } else { '0' };
+        invalid.pop();
+        invalid.push(replacement);
+        assert!(
+            store
+                .authenticate_mcp_client(&invalid, McpTransport::LoopbackHttp)
+                .is_err()
+        );
+
+        let active = store.list_mcp_clients(false).unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].last_used_at.is_some());
+        assert!(active[0].revoked_at.is_none());
+        store.revoke_mcp_client(&created.client.id).unwrap();
+        assert!(store.list_mcp_clients(false).unwrap().is_empty());
+        assert_eq!(store.list_mcp_clients(true).unwrap().len(), 1);
+        assert!(
+            store
+                .authenticate_mcp_client(&created.bearer_token, McpTransport::LoopbackHttp)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_group_listing_uses_only_active_grants_for_active_clients() {
+        let store = store();
+        let client = mcp_client_with_role(&store, "Reader", "team/zeta", McpGroupRole::Viewer);
+        store
+            .set_mcp_group_grant(SetMcpGroupGrantInput {
+                client_id: client.client.id.clone(),
+                group: "team/alpha".to_string(),
+                role: McpGroupRole::Contributor,
+            })
+            .unwrap();
+        assert_eq!(
+            store.mcp_list_groups(&client.client.id).unwrap(),
+            vec!["team/alpha".to_string(), "team/zeta".to_string()]
+        );
+
+        let updated_grant = store
+            .set_mcp_group_grant(SetMcpGroupGrantInput {
+                client_id: client.client.id.clone(),
+                group: "team/alpha".to_string(),
+                role: McpGroupRole::Coordinator,
+            })
+            .unwrap();
+        assert_eq!(updated_grant.role, McpGroupRole::Coordinator);
+        assert_eq!(
+            store
+                .list_mcp_group_grants(Some(&client.client.id), false)
+                .unwrap()
+                .into_iter()
+                .find(|grant| grant.group == "team/alpha")
+                .unwrap()
+                .role,
+            McpGroupRole::Coordinator
+        );
+
+        store
+            .revoke_mcp_group_grant(&client.client.id, "team/alpha")
+            .unwrap();
+        assert_eq!(
+            store.mcp_list_groups(&client.client.id).unwrap(),
+            vec!["team/zeta".to_string()]
+        );
+        assert_eq!(
+            store
+                .list_mcp_group_grants(Some(&client.client.id), true)
+                .unwrap()
+                .len(),
+            2
+        );
+        store.revoke_mcp_client(&client.client.id).unwrap();
+        assert!(store.mcp_list_groups(&client.client.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mcp_reads_filter_before_decryption_and_omit_desktop_state() {
+        let store = store();
+        let client = mcp_client_with_role(&store, "Reader", "shared", McpGroupRole::Viewer);
+
+        let mut visible_input = note_input("shared text");
+        visible_input.group = Some("shared".to_string());
+        let visible = store.create_item(visible_input).unwrap();
+
+        let mut denied_input = note_input("must remain private");
+        denied_input.group = Some("shared".to_string());
+        denied_input.mcp_access = Some(McpAccess::Deny);
+        let denied = store.create_item(denied_input).unwrap();
+
+        let mut sensitive_input = note_input("also private");
+        sensitive_input.group = Some("shared".to_string());
+        let sensitive = store.create_item(sensitive_input).unwrap();
+
+        let secret = store
+            .create_item(CreateItemInput {
+                kind: ItemKind::Secret,
+                group: Some("shared".to_string()),
+                title: "Password".to_string(),
+                content: "do not expose".to_string(),
+                color: None,
+                tags: vec![],
+                due_at: None,
+                expires_at: None,
+                mcp_access: Some(McpAccess::ReadWrite),
+                todo_entries: vec![],
+            })
+            .unwrap();
+
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE items SET content_ciphertext = X'00' WHERE id = ?1",
+                    [&denied.id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE items SET sensitivity = 'sensitive', content_ciphertext = X'00' WHERE id = ?1",
+                    [&sensitive.id],
+                )
+                .unwrap();
+        }
+
+        let listed = store
+            .mcp_list_items(
+                &client.client.id,
+                McpListItemsInput {
+                    group: "shared".to_string(),
+                    kind: None,
+                    status: None,
+                    updated_after: None,
+                    limit: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, visible.id);
+        assert_eq!(listed[0].content, "shared text");
+        for unavailable in [&denied.id, &sensitive.id, &secret.id] {
+            assert!(store.mcp_get_item(&client.client.id, unavailable).is_err());
+        }
+
+        let serialized = serde_json::to_value(&listed[0]).unwrap();
+        let object = serialized.as_object().unwrap();
+        for forbidden in ["window", "color", "sensitivity", "mcpAccess", "expiresAt"] {
+            assert!(!object.contains_key(forbidden));
+        }
+    }
+
+    #[test]
+    fn mcp_mutations_enforce_roles_item_access_and_revisions() {
+        let store = store();
+        let writer =
+            mcp_client_with_role(&store, "Writer", "project/core", McpGroupRole::Contributor);
+        let viewer = mcp_client_with_role(&store, "Viewer", "project/core", McpGroupRole::Viewer);
+
+        assert!(
+            store
+                .mcp_create_item(
+                    &viewer.client.id,
+                    McpCreateItemInput {
+                        group: "project/core".to_string(),
+                        kind: ItemKind::Note,
+                        title: "denied".to_string(),
+                        content: "denied".to_string(),
+                        tags: vec![],
+                        due_at: None,
+                        todo_entries: vec![],
+                    },
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .mcp_create_item(
+                    &writer.client.id,
+                    McpCreateItemInput {
+                        group: "project/core".to_string(),
+                        kind: ItemKind::Secret,
+                        title: "secret".to_string(),
+                        content: "secret".to_string(),
+                        tags: vec![],
+                        due_at: None,
+                        todo_entries: vec![],
+                    },
+                )
+                .is_err()
+        );
+
+        let created = store
+            .mcp_create_item(
+                &writer.client.id,
+                McpCreateItemInput {
+                    group: "project/core".to_string(),
+                    kind: ItemKind::Todo,
+                    title: "Release".to_string(),
+                    content: String::new(),
+                    tags: vec!["release".to_string()],
+                    due_at: None,
+                    todo_entries: vec!["Run tests".to_string()],
+                },
+            )
+            .unwrap();
+        assert_eq!(created.todo_entries.len(), 1);
+        let entry = &created.todo_entries[0];
+        let completed = store
+            .mcp_set_todo_entry_completed(
+                &writer.client.id,
+                McpSetTodoEntryCompletedInput {
+                    item_id: created.id.clone(),
+                    entry_id: entry.id.clone(),
+                    expected_item_revision: created.revision,
+                    expected_entry_revision: entry.revision,
+                    is_completed: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(completed.status, ItemStatus::Completed);
+        assert_eq!(completed.revision, 2);
+
+        let updated = store
+            .mcp_update_item(
+                &writer.client.id,
+                McpUpdateItemInput {
+                    id: completed.id.clone(),
+                    expected_revision: completed.revision,
+                    title: "Release now".to_string(),
+                    content: "Ready".to_string(),
+                    tags: vec!["release".to_string()],
+                    due_at: None,
+                    todo_entries: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.revision, 3);
+        assert_eq!(updated.title, "Release now");
+        assert!(
+            store
+                .mcp_set_status(
+                    &writer.client.id,
+                    McpSetStatusInput {
+                        id: updated.id.clone(),
+                        expected_revision: 2,
+                        status: ItemStatus::Active,
+                    },
+                )
+                .is_err()
+        );
+
+        let read_only = {
+            let mut input = note_input("read only");
+            input.group = Some("project/core".to_string());
+            input.mcp_access = Some(McpAccess::Read);
+            store.create_item(input).unwrap()
+        };
+        assert!(
+            store
+                .mcp_update_item(
+                    &writer.client.id,
+                    McpUpdateItemInput {
+                        id: read_only.id.clone(),
+                        expected_revision: read_only.revision,
+                        title: "not allowed".to_string(),
+                        content: "not allowed".to_string(),
+                        tags: vec![],
+                        due_at: None,
+                        todo_entries: None,
+                    },
+                )
+                .is_err()
+        );
+
+        let connection = store.connection.lock().unwrap();
+        let events: Vec<(String, i64)> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT action, item_revision FROM task_events WHERE item_id = ?1 ORDER BY event_id",
+                )
+                .unwrap();
+            statement
+                .query_map([&created.id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(
+            events,
+            vec![
+                ("item.created".to_string(), 1),
+                ("todo_entry.completed_changed".to_string(), 2),
+                ("item.updated".to_string(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn mcp_mutations_roll_back_when_their_result_cannot_be_built() {
+        let store = store();
+        let writer = mcp_client_with_role(&store, "Writer", "shared", McpGroupRole::Contributor);
+        let original = store
+            .mcp_create_item(
+                &writer.client.id,
+                McpCreateItemInput {
+                    group: "shared".to_string(),
+                    kind: ItemKind::Todo,
+                    title: "Original".to_string(),
+                    content: String::new(),
+                    tags: vec![],
+                    due_at: None,
+                    todo_entries: vec!["First".to_string()],
+                },
+            )
+            .unwrap();
+        let entry = original.todo_entries[0].clone();
+        let original_ciphertext: Vec<u8> = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT content_ciphertext FROM items WHERE id = ?1",
+                [&original.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // Simulate authorization disappearing between the mutation and result construction. The
+        // trigger runs inside the mutation transaction, so a correct implementation must fail the
+        // result lookup before commit and roll back the item, event, and trigger side effect.
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER test_hide_mcp_mutation_result
+                AFTER INSERT ON task_events
+                BEGIN
+                    UPDATE items SET group_key = 'moved' WHERE id = NEW.item_id;
+                END;
+                "#,
+            )
+            .unwrap();
+
+        let create_error = store
+            .mcp_create_item(
+                &writer.client.id,
+                McpCreateItemInput {
+                    group: "shared".to_string(),
+                    kind: ItemKind::Note,
+                    title: "Must roll back".to_string(),
+                    content: "not committed".to_string(),
+                    tags: vec![],
+                    due_at: None,
+                    todo_entries: vec![],
+                },
+            )
+            .unwrap_err();
+        assert!(create_error.contains("not found or access denied"));
+
+        let update_error = store
+            .mcp_update_item(
+                &writer.client.id,
+                McpUpdateItemInput {
+                    id: original.id.clone(),
+                    expected_revision: original.revision,
+                    title: "Must roll back".to_string(),
+                    content: "not committed".to_string(),
+                    tags: vec![],
+                    due_at: None,
+                    todo_entries: None,
+                },
+            )
+            .unwrap_err();
+        assert!(update_error.contains("not found or access denied"));
+
+        let status_error = store
+            .mcp_set_status(
+                &writer.client.id,
+                McpSetStatusInput {
+                    id: original.id.clone(),
+                    expected_revision: original.revision,
+                    status: ItemStatus::Archived,
+                },
+            )
+            .unwrap_err();
+        assert!(status_error.contains("not found or access denied"));
+
+        let todo_error = store
+            .mcp_set_todo_entry_completed(
+                &writer.client.id,
+                McpSetTodoEntryCompletedInput {
+                    item_id: original.id.clone(),
+                    entry_id: entry.id.clone(),
+                    expected_item_revision: original.revision,
+                    expected_entry_revision: entry.revision,
+                    is_completed: true,
+                },
+            )
+            .unwrap_err();
+        assert!(todo_error.contains("not found or access denied"));
+
+        let connection = store.connection.lock().unwrap();
+        let item_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        let event_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_events", [], |row| row.get(0))
+            .unwrap();
+        let (group, title, content_ciphertext, status, revision): (
+            String,
+            String,
+            Vec<u8>,
+            String,
+            i64,
+        ) = connection
+            .query_row(
+                r#"
+                SELECT group_key, title, content_ciphertext, status, revision
+                FROM items
+                WHERE id = ?1
+                "#,
+                [&original.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let (entry_completed, entry_revision): (i64, i64) = connection
+            .query_row(
+                "SELECT is_completed, revision FROM todo_entries WHERE id = ?1",
+                [&entry.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(item_count, 1);
+        assert_eq!(event_count, 1);
+        assert_eq!(group, "shared");
+        assert_eq!(title, "Original");
+        assert_eq!(status, "active");
+        assert_eq!(revision, 1);
+        assert_eq!(entry_completed, 0);
+        assert_eq!(entry_revision, 1);
+        assert_eq!(content_ciphertext, original_ciphertext);
     }
 
     #[test]
@@ -1801,5 +4126,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(raw, "\"black_gold\"");
+    }
+
+    #[test]
+    fn locale_defaults_to_system_and_is_persisted() {
+        let store = store();
+        assert_eq!(store.get_locale().unwrap(), LocalePreference::System);
+
+        assert_eq!(
+            store
+                .set_locale(LocalePreference::SimplifiedChinese)
+                .unwrap(),
+            LocalePreference::SimplifiedChinese
+        );
+        assert_eq!(
+            store.get_locale().unwrap(),
+            LocalePreference::SimplifiedChinese
+        );
+
+        let connection = store.connection.lock().unwrap();
+        let raw: String = connection
+            .query_row(
+                "SELECT value_json FROM settings WHERE key = ?1",
+                [LOCALE_SETTING_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, "\"zh-CN\"");
     }
 }

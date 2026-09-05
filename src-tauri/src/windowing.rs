@@ -1,7 +1,8 @@
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 
 use crate::{
-    model::{WindowGeometryInput, WindowState},
+    model::{LocalePreference, WindowGeometryInput, WindowState},
+    native_i18n,
     store::Store,
 };
 
@@ -22,6 +23,9 @@ pub fn open_sticky(app: &AppHandle, store: &Store, item_id: &str) -> Result<Stri
             .set_always_on_top(state.always_on_top)
             .map_err(|error| format!("restore pin state failed: {error}"))?;
         window
+            .unminimize()
+            .map_err(|error| format!("restore minimized sticky window failed: {error}"))?;
+        window
             .show()
             .map_err(|error| format!("show sticky window failed: {error}"))?;
         window
@@ -32,9 +36,11 @@ pub fn open_sticky(app: &AppHandle, store: &Store, item_id: &str) -> Result<Stri
     }
 
     let url = WebviewUrl::App(format!("index.html?view=sticky&id={item_id}").into());
+    let locale = store.get_locale().unwrap_or(LocalePreference::System);
+    let fallback_title = native_i18n::texts_for_preference(locale).sticky_fallback_title;
     let mut builder = WebviewWindowBuilder::new(app, &label, url)
         .title(if item.title.is_empty() {
-            "Tips 便签"
+            fallback_title
         } else {
             &item.title
         })

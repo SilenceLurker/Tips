@@ -24,12 +24,17 @@ Tips 以“本地优先、最小权限、所有持久化内容均视为不可信
 
 ## MCP 暴露基线
 
-MCP 服务端尚未实现。实现时必须遵守 [MCP_CONTRACT.md](MCP_CONTRACT.md)：
+当前 MCP 服务遵守 [MCP_CONTRACT.md](MCP_CONTRACT.md) 的最小本机边界：
 
-- 默认仅绑定 `127.0.0.1`，不存在匿名回退或隐式 `0.0.0.0` 监听。
-- LAN 模式必须显式开启，并使用 bearer token 哈希、按组授权、Origin 校验和 TLS。
-- 客户端身份从认证连接派生，不接受调用方伪造 actor、assignee 或 claimant。
-- Secret 永远不进入 MCP；所有写操作使用 revision/claim revision 防止静默覆盖。
+- 只绑定 `127.0.0.1`，不存在匿名回退、隐式 `0.0.0.0` 监听或已实现的 LAN 开关。
+- 每个 HTTP 请求都必须携带 Bearer token；token 使用高熵随机值，只在创建时返回一次，持久化时仅保存 SHA-256 哈希，并与 transport 绑定。
+- SDK 层校验精确的 loopback `Host` 和 `Origin`，请求体上限为 1 MiB，并以共享信号量限制同时处理的请求数；缺失 `Origin` 的非浏览器客户端仍可使用。
+- 客户端身份从认证请求派生，不接受工具参数伪造 actor。读取和写入均检查活跃客户端、活跃分组授权及角色。
+- MCP 使用独立 SQL 查询与 DTO；在解密前排除 Secret、敏感内容、`mcp_access = deny` 和无权分组，且永不返回桌面窗口与外观状态。
+- 写操作使用 item/entry revision 防止静默覆盖，并在同一 SQLite 事务内记录 MCP 事件。
+- MCP 写入的毫秒时间戳受统一范围校验；前端日期格式化也会对损坏或超范围的旧数据降级显示。
+- 客户端签发、授权查询与撤销命令只接受主窗口发起的 IPC；悬浮便签窗口不能管理持久 MCP 凭据。
+- 未来的 LAN 模式必须显式开启，并额外落实 TLS 或可信反向代理；当前版本遇到非回环配置会拒绝启动 MCP 服务，但不会拖垮桌面应用。
 
 ## 本地验证
 

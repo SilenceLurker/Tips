@@ -151,6 +151,16 @@ pub enum ThemeMode {
     BlackGold,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalePreference {
+    #[serde(rename = "system")]
+    System,
+    #[serde(rename = "zh-CN")]
+    SimplifiedChinese,
+    #[serde(rename = "en-US")]
+    English,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowState {
@@ -203,6 +213,36 @@ pub struct Item {
     pub archived_at: Option<i64>,
     pub window: Option<WindowState>,
     pub todo_entries: Vec<TodoEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemGroup {
+    pub key: String,
+    pub item_count: i64,
+    pub visible_item_count: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateGroupInput {
+    pub group: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameGroupInput {
+    pub group: String,
+    pub new_group: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupChangedEvent {
+    pub previous_key: Option<String>,
+    pub group: ItemGroup,
 }
 
 #[derive(Debug, Deserialize)]

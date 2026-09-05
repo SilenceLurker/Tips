@@ -4,6 +4,49 @@ export type Sensitivity = "standard" | "sensitive";
 export type McpAccess = "inherit" | "deny" | "read" | "read_write";
 export type ItemColor = "sun" | "mint" | "sky" | "rose" | "lilac" | "paper";
 export type ThemeMode = "light" | "black_gold";
+export type LocalePreference = "system" | "zh-CN" | "en-US";
+export type SupportedLocale = Exclude<LocalePreference, "system">;
+export type McpTransport = "stdio" | "loopback_http" | "lan_http";
+export type McpGroupRole = "viewer" | "contributor" | "coordinator";
+
+export interface McpRuntimeStatus {
+  enabled: boolean;
+  running: boolean;
+  endpoint: string;
+  error: string | null;
+}
+
+export interface McpClient {
+  id: string;
+  displayName: string;
+  transport: McpTransport;
+  canManageGroups: boolean;
+  createdAt: number;
+  lastUsedAt: number | null;
+  revokedAt: number | null;
+}
+
+export interface McpGroupGrant {
+  clientId: string;
+  group: string;
+  role: McpGroupRole;
+  createdAt: number;
+  revokedAt: number | null;
+}
+
+export interface ProvisionMcpClientInput {
+  displayName: string;
+  groupName: string;
+  role: McpGroupRole;
+  canManageGroups: boolean;
+}
+
+export interface ProvisionedMcpClient {
+  client: McpClient;
+  bearerToken: string;
+  grant: McpGroupGrant;
+  endpoint: string;
+}
 
 export interface WindowState {
   x: number | null;
@@ -53,6 +96,19 @@ export interface Item {
   todoEntries: TodoEntry[];
 }
 
+export interface ItemGroup {
+  key: string;
+  itemCount: number;
+  visibleItemCount: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface GroupChangedEvent {
+  previousKey: string | null;
+  group: ItemGroup;
+}
+
 export interface CreateItemInput {
   kind: ItemKind;
   group: string;
@@ -86,17 +142,5 @@ export interface UpdateItemInput {
   todoEntries?: TodoEntryDraftInput[];
 }
 
-export const colorOptions: Array<{ value: ItemColor; label: string }> = [
-  { value: "sun", label: "暖黄" },
-  { value: "mint", label: "薄荷" },
-  { value: "sky", label: "雾蓝" },
-  { value: "rose", label: "浅绯" },
-  { value: "lilac", label: "丁香" },
-  { value: "paper", label: "纸白" },
-];
-
-export const kindLabels: Record<ItemKind, string> = {
-  note: "便签",
-  todo: "TODO",
-  secret: "临时秘密",
-};
+export const colorOptions: ItemColor[] = ["sun", "mint", "sky", "rose", "lilac", "paper"];
+export const kindOptions: ItemKind[] = ["note", "todo", "secret"];
