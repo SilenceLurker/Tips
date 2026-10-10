@@ -2,6 +2,10 @@
 
 一个本地优先的跨平台桌面便签，面向 Windows、macOS 和 Linux。它既可以留在桌面上，也可以通过受控的 MCP 接口成为多个本地 Agent 共享的便签与 TODO 表单。
 
+## 下载安装
+
+在 [GitHub Releases](https://github.com/SilenceLurker/Tips/releases) 下载对应平台的安装包。Windows 提供 x64 安装程序，macOS 分别提供 Apple Silicon / Intel DMG，Linux 提供 x64 DEB / AppImage。每版附带 `SHA256SUMS.txt`；当前 `0.x` 版本标记为预发布版，平台要求和功能边界见对应版本说明。
+
 ## 当前能力
 
 - 便签、TODO、临时秘密三种条目。
@@ -58,3 +62,5 @@
 ## 开发与验证
 
 开发环境、构建命令和源码导航见 [`CONTRIBUTING.md`](CONTRIBUTING.md)；隔离数据目录、悬浮窗烟测和独立 debug 构建说明见 [`docs/SMOKE_TESTING.md`](docs/SMOKE_TESTING.md)。
+
+发布通过版本标签触发的 [Release workflow](.github/workflows/release.yml) 完成：版本校验、四平台构建和测试全部通过后，才公开安装包与校验文件。

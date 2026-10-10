@@ -2,6 +2,7 @@
   "name": "tips-desktop",
   "private": true,
   "version": "0.1.0",
+  "packageManager": "pnpm@10.34.5",
   "engines": {
     "node": ">=22"
   },
@@ -11,6 +12,8 @@
     "security:check": "node scripts/security-check.mjs",
     "build": "pnpm security:check && vue-tsc --noEmit && vite build",
     "build:desktop": "tauri build --no-bundle",
+    "build:release": "tauri build",
+    "release:check": "node scripts/release-check.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
