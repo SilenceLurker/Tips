@@ -34,7 +34,7 @@ GitHub 发布流程如下：
 
 `0.x` 版本和带预发布后缀的版本自动标记为 prerelease。失败时不会公开不完整的 Release；修复后可从 Actions 手动指定已存在标签重新运行。已公开的版本不会覆盖，请升级版本号再发布。
 
-当前未配置 Windows 发行者证书或 Apple Developer notarization；macOS 包仅使用 ad-hoc 签名。各平台实际安装、凭据库、托盘和悬浮窗行为仍需桌面验收。
+当前未配置 Windows 发行者证书或 Apple Developer notarization；macOS 包仅使用 ad-hoc 签名。macOS 透明悬浮窗启用了 Tauri `macos-private-api`，目前采用 DMG 分发，不适合 App Store 上架。各平台实际安装、凭据库、托盘和悬浮窗行为仍需桌面验收。
 
 ## 提交前检查
 

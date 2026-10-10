@@ -9,16 +9,22 @@ const tauriConfig = JSON.parse(
 );
 const manifest = await readFile(path.join(root, "src-tauri", "Cargo.toml"), "utf8");
 const packageSection = manifest.match(/^\[package\]\s*\n([\s\S]*?)(?=^\[|$(?![\s\S]))/m)?.[1];
+const cargoName = packageSection?.match(/^name\s*=\s*"([^"]+)"/m)?.[1];
 const cargoVersion = packageSection?.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+const lock = await readFile(path.join(root, "src-tauri", "Cargo.lock"), "utf8");
+const lockedPackage = lock.split(/^\[\[package\]\]/m).find(
+  (section) => section.match(/^name\s*=\s*"([^"]+)"/m)?.[1] === cargoName,
+);
+const lockedVersion = lockedPackage?.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 const version = packageJson.version;
 const tag = process.argv[2] || process.env.RELEASE_TAG || `v${version}`;
 
 if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/.test(version)) {
   throw new Error(`Invalid release version: ${version}`);
 }
-if (version !== tauriConfig.version || version !== cargoVersion) {
+if (version !== tauriConfig.version || version !== cargoVersion || version !== lockedVersion) {
   throw new Error(
-    `Versions must match: package.json=${version}, tauri.conf.json=${tauriConfig.version}, Cargo.toml=${cargoVersion}`,
+    `Versions must match: package.json=${version}, tauri.conf.json=${tauriConfig.version}, Cargo.toml=${cargoVersion}, Cargo.lock=${lockedVersion}`,
   );
 }
 if (tag !== `v${version}`) {
